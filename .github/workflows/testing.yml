@@ -1,0 +1,18 @@
+name: Testing
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: oracle-vm-32cpu-128gb-arm64
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run tests
+      run: |
+        # Replace this with your actual test command
+        echo "Running tests..."
+        exit 0
