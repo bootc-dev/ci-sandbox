@@ -1,0 +1,17 @@
+name: Test Runners
+
+on:
+#  push:
+#    branches:
+#      - main
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  test-runner:
+    runs-on: bootc-16c 
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
