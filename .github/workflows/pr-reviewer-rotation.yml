@@ -1,0 +1,56 @@
+name: PR Reviewer Rotation
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, synchronize]
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode (dry run)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  assign-reviewer:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyGithub
+
+      - name: Get PR number for push events
+        id: get-pr-number
+        if: github.event_name == 'push'
+        run: |
+          # Get PR number using GitHub API
+          BRANCH_NAME="${{ github.ref_name }}"
+          PR_RESPONSE=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:$BRANCH_NAME")
+          PR_NUMBER=$(echo "$PR_RESPONSE" | jq -r '.[0].number // empty')
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Run reviewer assignment script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python .github/scripts/assign_reviewer.py \
+            --pr-number ${{ github.event.pull_request.number || steps.get-pr-number.outputs.pr_number }} \
+            --repo ${{ github.repository }} \
+            ${{ inputs.test_mode && '--test-mode' || '' }}
+        if: ${{ github.event.pull_request.number || steps.get-pr-number.outputs.pr_number != '' }}

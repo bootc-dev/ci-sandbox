@@ -1,0 +1,10 @@
+{
+  "sprint_config": {
+    "weeks_per_sprint": 3,
+    "start_date": "2024-01-01",
+    "pool_size": 3
+  },
+  "maintainers_file": "MAINTAINERS.md",
+  "preserve_manual_assignments": true,
+  "log_level": "INFO"
+}
