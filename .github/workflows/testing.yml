@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         #shape: [2cpu-8gb, 4cpu-16gb, 8cpu-32gb, 16cpu-64gb, 24cpu-384gb]
-        shape: [8cpu-32gb]
+        shape: [2cpu-8gb]
         arch: ["x86-64", "arm64"]
     runs-on: oracle-vm-${{ matrix.shape }}-${{ matrix.arch }}
 
