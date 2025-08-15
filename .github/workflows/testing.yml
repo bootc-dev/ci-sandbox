@@ -10,7 +10,7 @@ jobs:
   cncf_ora_rnrs_matrix:
     strategy:
       matrix:
-        cncf_runner: [oracle-16cpu-64gb-x86-64, oracle-16cpu-64gb-arm64, oracle-4cpu-16gb-x86-64, oracle-8cpu-32gb-x86-64, oracle-24cpu-384gb-x86-64, oracle-2cpu-8gb-arm64]
+        cncf_runner: [oracle-16cpu-64gb-x86-64, oracle-16cpu-64gb-arm64, oracle-4cpu-16gb-x86-64, oracle-2cpu-8gb-arm64]
 
     runs-on: ${{ matrix.cncf_runner }}
     steps:
