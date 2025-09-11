@@ -1,15 +1,7 @@
-# Please change the image when you run this plan locally with tmt run
-# tmt run -vvvvv plan -n /integration/test-01-readonly
-# local image: file:///home/foobar/image.qcow2
 provision:
   how: virtual
-  image: fedora-rawhide
-prepare:
-  - how: install
-    package:
-      - podman
-      - skopeo
-      - jq
+  # Build via `./tests/build.sh`
+  image: target/integration-disk.img
 execute:
   how: tmt
 
@@ -18,7 +10,6 @@ execute:
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
         - /tmt/tests/test-01-readonly
 
 /test-20-local-upgrade:
@@ -26,15 +17,13 @@ execute:
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
-        - /tmt/tests/test-20-local-upgrade
+        - /tmt/tests/test-20-local-upgradewww
 
 /test-21-logically-bound-switch:
   summary: Execute logically bound images tests for switching images
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
         - /tmt/tests/test-21-logically-bound-switch
 
 /test-22-logically-bound-install:
@@ -44,7 +33,6 @@ execute:
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
         - /tmt/tests/test-22-logically-bound-install
 
 /test-23-install-outside-container:
@@ -52,7 +40,6 @@ execute:
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
         - /tmt/tests/test-23-install-outside-container
 
 /test-24-local-upgrade-reboot:
@@ -60,7 +47,6 @@ execute:
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
         - /tmt/tests/test-24-local-upgrade-reboot
 
 /test-25-soft-reboot:
@@ -68,5 +54,4 @@ execute:
   discover:
     how: fmf
     test:
-        - /tmt/tests/bootc-install-provision
         - /tmt/tests/test-25-soft-reboot
