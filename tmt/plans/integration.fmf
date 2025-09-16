@@ -1,7 +1,7 @@
 provision:
   how: virtual
   # Build via `./tests/build.sh`
-  image: target/integration-disk.img
+  image: $@{test_disk_image}
 execute:
   how: tmt
 

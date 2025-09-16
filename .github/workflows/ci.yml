@@ -56,7 +56,9 @@ jobs:
         run: sudo apt update && sudo apt install just
       - uses: actions/checkout@v4
       - name: Build and run container integration tests
-        run: sudo just run-container-integration run-container-external-tests
+        run: |
+          sudo just build
+          sudo just run-container-integration run-container-external-tests
   container-continuous:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'control/skip-ci') }}
     runs-on: ubuntu-24.04
@@ -105,6 +107,7 @@ jobs:
           set -xeu
           # Build images to test; TODO investigate doing single container builds
           # via GHA and pushing to a temporary registry to share among workflows?
+          sudo just build
           sudo just build-integration-test-image
           sudo podman build -t localhost/bootc-fsverity -f ci/Containerfile.install-fsverity
 

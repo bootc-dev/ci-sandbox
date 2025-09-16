@@ -7,7 +7,7 @@ set -exuo pipefail
 # If provided should be of the form fedora-42 or centos-10
 target=${1:-}
 
-bcvk=$(which bcvk 2>/dev/null)
+bcvk=$(which bcvk 2>/dev/null || true)
 if test -z "${bcvk}" && test "$(id -u)" != 0; then
     echo "This script currently requires full root"; exit 1
 fi
@@ -40,7 +40,7 @@ just build-integration-test-image
 # for output artifacts
 mkdir -p target
 
-DISK=target/integration-test.raw
+DISK=target/bootc-integration-test.raw
 SIZE=10G
 rm -vf "${DISK}"
 if test -n "${bcvk}"; then
@@ -63,3 +63,8 @@ else
   --via-loopback \
   /target/$(basename ${DISK})
 fi
+# testcloud barfs on .raw sadly; FIXME drop this once it's been changed.
+# Alternatively we could teach bcvk how to write qcow2 easily enough.
+qemu-img convert -f raw -O qcow2 ${DISK} target/bootc-integration-test.qcow2
+rm -f "${DISK}"
+

@@ -23,10 +23,14 @@ case "${ID}-${VERSION_ID}" in
         ;;
     "centos-10"|"rhel-10."*)
         # nu is not available in CS10
+        td=$(mktemp -d)
+        cd $td
         curl -kL "https://github.com/nushell/nushell/releases/download/0.103.0/nu-0.103.0-$(uname -m)-unknown-linux-gnu.tar.gz" --output nu.tar.gz
         mkdir -p nu && tar zvxf nu.tar.gz --strip-components=1 -C nu
         mv nu/nu /usr/bin/nu
         rm -rf nu nu.tar.gz
+        cd -
+        rm -rf "${td}"
         ;;
     "fedora-"*)
         dnf -y install nu
@@ -37,10 +41,20 @@ esac
 grep -Ev -e '^#' packages.txt | xargs dnf -y install
 dnf clean all
 
+# Cloud bits
+cat <<KARGEOF >> /usr/lib/bootc/kargs.d/20-console.toml
+kargs = ["console=ttyS0,115200n8"]
+KARGEOF
+# And cloud-init stuff
+ln -s ../cloud-init.target /usr/lib/systemd/system/default.target.wants
+
 # Stock extra cleaning of logs and caches in general (mostly dnf)
 rm /var/log/* /var/cache /var/lib/{dnf,rpm-state,rhsm} -rf
 # And clean root's homedir
 rm /var/roothome/.config -rf
+cat >/usr/lib/tmpfiles.d/bootc-cloud-init.conf <<'EOF'
+d /var/lib/cloud 0755 root root - -
+EOF
 
 # Fast track tmpfiles.d content from the base image, xref
 # https://gitlab.com/fedora/bootc/base-images/-/merge_requests/92
@@ -66,3 +80,13 @@ if ! grep -q -r sudo /usr/lib/sysusers.d; then
 g sudo 16
 EOF
 fi
+
+# dhcpcd
+if ! grep -q -r dhcpcd /usr/lib/sysusers.d; then
+  cat >/usr/lib/sysusers.d/bootc-dhcpcd-workaround.conf <<'EOF'
+u dhcpcd - 'Minimalistic DHCP client' /var/lib/dhcpcd
+EOF
+fi
+cat >/usr/lib/tmpfiles.d/bootc-dhcpd.conf <<'EOF'
+d /var/lib/dhcpcd 0755 root root - -
+EOF

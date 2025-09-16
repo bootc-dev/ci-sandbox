@@ -15,6 +15,9 @@ ARG variant=
 RUN --mount=type=bind,from=context,target=/run/context <<EORUN
 set -xeuo pipefail
 cd /run/context/hack
+# https://gitlab.com/fedora/bootc/base-images/-/issues/65
+rm -rf /usr/lib/sysimage/rpm-ostree-base-db
+# cache blowout 20250915
 ./provision-derived.sh "$variant"
 
 # For test-22-logically-bound-install
