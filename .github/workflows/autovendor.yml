@@ -12,13 +12,13 @@ jobs:
   vendor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Install vendor tool
         run: cargo install cargo-vendor-filterer
       - name: Run
         run: mkdir -p target && cd crates/cli && cargo vendor-filterer --format=tar.zstd --prefix=vendor/ ../../target/vendor.tar.zst
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: vendor.tar.zst
           path: target/vendor.tar.zst
