@@ -11,7 +11,13 @@ permissions: {}
 jobs:
   test-runner:
     runs-on: bootc-16c 
-
+    snapshot:
+      image-name: bootc-ubuntu-2404
+      version: 0.*
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Bootc Ubuntu Setup
+        uses: ./.github/actions/bootc-ubuntu-setup
+        with:
+          libvirt: true
