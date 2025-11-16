@@ -1,0 +1,17 @@
+name: Test on bootc-16c
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  test-runner:
+    runs-on: bootc-ubuntu-2404
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup upterm session
+        uses: owenthereal/action-upterm@v1
+        with:
+          limit-access-to-actor: true # Restrict to the user who triggered the workflow
