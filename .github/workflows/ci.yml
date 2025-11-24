@@ -1,0 +1,260 @@
+# CI Workflow for bootc
+#
+# Core principles:
+# - Everything done here should be easy to replicate locally. Most tasks
+#   should invoke `just <something>`. Read the Justfile for more explanation
+#   of this.
+# - Most additions to this should be extending existing tasks; e.g.
+#   there's places for unit and integration tests already.
+name: CI
+
+permissions:
+  actions: read
+  packages: write
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Something seems to be setting this in the default GHA runners, which breaks bcvk
+  # as the default runner user doesn't have access
+  LIBVIRT_DEFAULT_URI: "qemu:///session"
+  DEV_IMAGE: ghcr.io/bootc-dev/dev-bootc
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Run basic validation checks (linting, formatting, etc)
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootc Ubuntu Setup
+        uses: ./.github/actions/bootc-ubuntu-setup
+      - name: Validate (default)
+        run: just validate
+  # Check for security vulnerabilities and license compliance
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+    - uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        log-level: warn
+        command: check -A duplicate bans sources licenses
+  # Test bootc installation scenarios and fsverity support
+  # TODO convert to be an integration test
+  install-tests:
+    name: "Test install"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Bootc Ubuntu Setup
+        uses: ./.github/actions/bootc-ubuntu-setup
+      - name: Enable fsverity for /
+        run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
+      - name: Install utils
+        run: sudo apt -y install fsverity just
+      - name: Integration tests
+        run: |
+          set -xeu
+          # Build images to test; TODO investigate doing single container builds
+          # via GHA and pushing to a temporary registry to share among workflows?
+          sudo just build
+          sudo just build-install-test-image
+          sudo podman build -t localhost/bootc-fsverity -f ci/Containerfile.install-fsverity
+
+          # TODO move into a container, and then have this tool run other containers
+          cargo build --release -p tests-integration
+
+          df -h /
+          sudo install -m 0755 target/release/tests-integration /usr/bin/bootc-integration-tests
+          rm target -rf
+          df -h /
+          # The ostree-container tests
+          sudo podman run --privileged --pid=host -v /:/run/host -v $(pwd):/src:ro -v /var/tmp:/var/tmp \
+            --tmpfs /var/lib/containers \
+            -v /run/dbus:/run/dbus -v /run/systemd:/run/systemd localhost/bootc /src/crates/ostree-ext/ci/priv-integration.sh
+          # Nondestructive but privileged tests
+          sudo bootc-integration-tests host-privileged localhost/bootc-integration-install
+          # Install tests
+          sudo bootc-integration-tests install-alongside localhost/bootc-integration-install
+
+          # system-reinstall-bootc tests
+          cargo build --release -p system-reinstall-bootc
+
+          # not sure why this is missing in the ubuntu image but just creating this directory allows the tests to pass
+          sudo mkdir -p /run/sshd
+
+          sudo install -m 0755 target/release/system-reinstall-bootc /usr/bin/system-reinstall-bootc
+          # These tests may mutate the system live so we can't run in parallel
+          sudo bootc-integration-tests system-reinstall localhost/bootc-integration --test-threads=1
+
+          # And the fsverity case
+          sudo podman run --privileged --pid=host localhost/bootc-fsverity bootc install to-existing-root --stateroot=other \
+            --acknowledge-destructive --skip-fetch-check
+          # Crude cross check
+          sudo find /ostree/repo/objects -name '*.file' -type f | while read f; do
+            sudo fsverity measure $f >/dev/null
+          done
+  # Test that we can build documentation
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootc Ubuntu Setup
+        uses: ./.github/actions/bootc-ubuntu-setup
+      - name: Build mdbook
+        run: just build-mdbook
+  # Build bootc from source into a container image FROM each specified base `test_os`
+  # running unit and integration tests (using TMT, leveraging the support for nested virtualization
+  # in the GHA runners)
+  test-integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: [fedora-42, fedora-43, centos-9, centos-10]
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootc Ubuntu Setup
+        uses: ./.github/actions/bootc-ubuntu-setup
+        with:
+          libvirt: true
+      - name: Build bcvk from PR 159
+        run: |
+          git clone https://github.com/cgwalters/bcvk-fork /tmp/bcvk
+          cd /tmp/bcvk
+          git checkout bind-storage-ro-selinux
+          cargo build --release
+          sudo install -m 0755 target/release/bcvk /usr/local/bin/bcvk
+      - name: Install tmt
+        run: pip install --user "tmt[provision-virtual]"
+
+      - name: Setup env
+        run: |
+          BASE=$(just pullspec-for-os ${{ matrix.test_os }})
+          echo "BOOTC_base=${BASE}" >> $GITHUB_ENV
+
+      - name: Build container
+        run: |
+          just build-integration-test-image
+          # Extra cross-check (duplicating the integration test) that we're using the right base
+          used_vid=$(podman run --rm localhost/bootc-integration bash -c '. /usr/lib/os-release && echo ${ID}-${VERSION_ID}')
+          test ${{ matrix.test_os }} = "${used_vid}"
+
+      - name: Unit and container integration tests
+        run: just test-container
+
+      - name: Run all TMT tests
+        run: just test-tmt
+
+      - name: Archive TMT logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: tmt-log-PR-${{ github.event.number }}-${{ matrix.test_os }}-ostree-${{ env.ARCH }}
+          path: /var/tmp/tmt
+
+      - name: Login to ghcr.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push container image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          podman tag localhost/bootc ${{ env.DEV_IMAGE }}:${{ matrix.test_os }}
+          podman push ${{ env.DEV_IMAGE }}:${{ matrix.test_os }}
+
+  # This variant does composefs testing
+  test-integration-cfs:
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO expand this matrix, we need to make it better to override the target
+        # OS via Justfile variables too
+        test_os: [centos-10]
+        variant: [composefs-sealeduki-sdboot]
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Bootc Ubuntu Setup
+        uses: ./.github/actions/bootc-ubuntu-setup
+        with:
+          libvirt: true
+      - name: Build bcvk from PR 159
+        run: |
+          git clone https://github.com/cgwalters/bcvk-fork /tmp/bcvk
+          cd /tmp/bcvk
+          git checkout bind-storage-ro-selinux
+          cargo build --release
+          sudo install -m 0755 target/release/bcvk /usr/local/bin/bcvk
+      - name: Install tmt
+        run: pip install --user "tmt[provision-virtual]"
+
+      - name: Setup env
+        run: |
+          BASE=$(just pullspec-for-os ${{ matrix.test_os }})
+          echo "BOOTC_base=${BASE}" >> $GITHUB_ENV
+          echo "BOOTC_variant="${{ matrix.variant }} >> $GITHUB_ENV
+
+      - name: Build container
+        run: |
+          just build-integration-test-image
+
+      - name: Unit and container integration tests
+        run: just test-container
+
+      - name: Run TMT tests
+        # Note that this one only runs a subset of tests right now
+        run: just test-composefs
+
+      - name: Archive TMT logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: tmt-log-PR-${{ github.event.number }}-${{ matrix.test_os }}-cfs-${{ env.ARCH }}
+          path: /var/tmp/tmt
+
+      - name: Login to ghcr.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push container image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          podman tag localhost/bootc ${{ env.DEV_IMAGE }}:stream10-uki
+          podman push ${{ env.DEV_IMAGE }}:stream10-uki
+
+  # Sentinel job for required checks - configure this job name in repository settings
+  required-checks:
+    if: always()
+    needs: [cargo-deny, validate, test-integration, test-integration-cfs]
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+        if: >-
+          needs.cargo-deny.result != 'success' ||
+          needs.validate.result != 'success' ||
+          needs.test-integration.result != 'success' ||
+          needs.test-integration-cfs.result != 'success'

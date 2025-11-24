@@ -1,0 +1,100 @@
+---
+upstream_package_name: bootc
+downstream_package_name: bootc
+
+upstream_tag_template: v{version}
+
+specfile_path: contrib/packaging/bootc.spec
+
+srpm_build_deps:
+  - cargo
+  - git
+  - zstd
+  - libzstd-devel
+  - ostree-devel
+  - openssl-devel
+
+actions:
+  # The last setp here is required by Packit to return the archive name
+  # https://packit.dev/docs/configuration/actions#create-archive
+  create-archive:
+    - bash -c "cargo install cargo-vendor-filterer"
+    - bash -c "cargo xtask spec"
+    - bash -c "cat target/bootc.spec"
+    - bash -c "cp target/bootc* contrib/packaging/"
+    - bash -c "ls -1 target/bootc*.tar.zstd | grep -v 'vendor'"
+  # Do nothing with spec file. Two steps here are for debugging
+  fix-spec-file:
+    - bash -c "cat contrib/packaging/bootc.spec"
+    - bash -c "ls -al contrib/packaging/"
+
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      # Primary targets are c9s, c10s and supported fedora right now,
+      # which build for all architectures
+      - centos-stream-9-x86_64
+      - centos-stream-9-aarch64
+      - centos-stream-9-s390x
+      - centos-stream-10-x86_64
+      - centos-stream-10-aarch64
+      - centos-stream-10-s390x
+      - fedora-42-x86_64
+      - fedora-42-aarch64
+      - fedora-42-s390x
+      - fedora-43-x86_64
+      - fedora-43-aarch64
+      - fedora-43-s390x
+      # Sanity check on secondary targets, fewer architectures just
+      # because the chance that we break e.g. ppc64le *just* on
+      # rawhide is basically nil.
+      - fedora-rawhide-x86_64
+      - fedora-rawhide-aarch64
+      # Temporarily disabled due to too old Rust...reenable post 9.6
+      # - rhel-9-x86_64
+      # - rhel-9-aarch64
+
+  # Build on new commit to main branch
+  - job: copr_build
+    trigger: commit
+    branch: main
+    owner: rhcontainerbot
+    project: bootc
+    enable_net: true
+
+  - job: tests
+    trigger: pull_request
+    targets:
+      - centos-stream-9-x86_64
+      - centos-stream-9-aarch64
+      - centos-stream-10-x86_64
+      - centos-stream-10-aarch64
+      - fedora-42-x86_64
+      - fedora-42-aarch64
+      - fedora-43-x86_64
+      - fedora-43-aarch64
+      - fedora-rawhide-x86_64
+      - fedora-rawhide-aarch64
+    tmt_plan: /tmt/plans/integration
+    tf_extra_params:
+      environments:
+        - tmt:
+            context:
+              running_env: "packit"
+
+  - job: propose_downstream
+    trigger: release
+    dist_git_branches:
+      - fedora-all
+
+  - job: koji_build
+    trigger: commit
+    dist_git_branches:
+      - fedora-all
+
+  - job: bodhi_update
+    trigger: commit
+    dist_git_branches:
+      # Fedora rawhide updates are created automatically
+      - fedora-branched

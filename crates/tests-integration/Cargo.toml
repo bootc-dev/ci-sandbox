@@ -1,0 +1,34 @@
+# Our integration tests
+[package]
+name = "tests-integration"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tests-integration"
+path = "src/tests-integration.rs"
+
+[dependencies]
+# Workspace dependencies
+anyhow = { workspace = true }
+camino = { workspace = true }
+cap-std-ext = { workspace = true }
+clap = { workspace = true, features = ["derive","cargo"] }
+fn-error-context = { workspace = true }
+indoc = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+xshell = { workspace = true }
+bootc-kernel-cmdline = { path = "../kernel_cmdline", version = "0.0.0" }
+
+# Crate-specific dependencies
+libtest-mimic = "0.8.0"
+oci-spec = "0.8.0"
+rexpect = "0.6"
+
+[lints]
+workspace = true

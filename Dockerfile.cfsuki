@@ -1,0 +1,84 @@
+# Override via --build-arg=base=<image> to use a different base
+ARG base=localhost/bootc
+# This is where we get the tools to build the UKI
+ARG buildroot=quay.io/centos/centos:stream10
+FROM $base AS base
+
+FROM $buildroot as buildroot-base
+RUN <<EORUN
+set -xeuo pipefail
+
+# systemd-udev is required for /usr/lib/systemd/systemd-measure which
+# is used by ukify as invoked with the `--measure` flag below.  Not
+# strictly required, but nice to have the measured PCR values in the
+# output.
+dnf install -y systemd-ukify systemd-udev pesign openssl systemd-boot-unsigned
+dnf clean all
+EORUN
+
+FROM buildroot-base as kernel
+# Must be passed
+ARG COMPOSEFS_FSVERITY
+RUN --mount=type=secret,id=key \
+    --mount=type=secret,id=cert \
+    --mount=type=bind,from=base,target=/target \
+     <<EOF
+    set -eux
+
+    # Should be generated externally
+    test -n "${COMPOSEFS_FSVERITY}"
+
+    cmdline="composefs=${COMPOSEFS_FSVERITY} console=ttyS0,115200n8 enforcing=0 rw"
+
+    # pesign uses NSS database so create it from input cert/key
+    mkdir pesign
+    certutil -N -d pesign --empty-password
+    openssl pkcs12 -export -password 'pass:' -inkey /run/secrets/key -in /run/secrets/cert -out db.p12
+    pk12util -i db.p12 -W '' -d pesign
+    subject=$(openssl x509 -in /run/secrets/cert -subject | grep '^subject=CN=' | sed 's/^subject=CN=//')
+
+    kver=$(cd /target/usr/lib/modules && echo *)
+    ukify build \
+        --linux "/target/usr/lib/modules/$kver/vmlinuz" \
+        --initrd "/target/usr/lib/modules/$kver/initramfs.img" \
+        --uname="${kver}" \
+        --cmdline "${cmdline}" \
+        --os-release "@/target/usr/lib/os-release" \
+        --signtool pesign \
+        --secureboot-certificate-dir "pesign" \
+        --secureboot-certificate-name "${subject}" \
+        --measure \
+        --json pretty \
+        --output "/boot/$kver.efi"
+    # Sign systemd-boot as well
+    sdboot="/usr/lib/systemd/boot/efi/systemd-bootx64.efi"
+    pesign \
+        --certdir "pesign" \
+        --certificate "${subject}" \
+        --in "${sdboot}" \
+        --out "${sdboot}.signed" \
+        --sign
+    mv "${sdboot}.signed" "${sdboot}"
+EOF
+
+FROM base as final
+
+RUN --mount=type=bind,from=kernel,target=/run/kernel <<EOF
+set -xeuo pipefail
+kver=$(cd /usr/lib/modules && echo *)
+mkdir -p /boot/EFI/Linux
+# We put the UKI in /boot for now due to composefs verity not being the
+# same due to mtime of /usr/lib/modules being changed
+target=/boot/EFI/Linux/$kver.efi
+cp /run/kernel/boot/$kver.efi $target
+# And remove the defaults
+rm -v /usr/lib/modules/${kver}/{vmlinuz,initramfs.img}
+# Symlink into the /usr/lib/modules location
+ln -sr $target /usr/lib/modules/${kver}/$(basename $kver.efi)
+bootc container lint --fatal-warnings
+EOF
+
+FROM base as final-final
+COPY --from=final /boot /boot
+# Override the default
+LABEL containers.bootc=sealed
