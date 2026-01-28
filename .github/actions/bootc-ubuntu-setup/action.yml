@@ -14,7 +14,8 @@ runs:
       run: |
         set -xeuo pipefail
         sudo df -h
-        unwanted_pkgs=('^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' '^mongodb-.*' '^mysql-.*'
+        # Use globs for package patterns (apt and dpkg both support fnmatch globs)
+        unwanted_pkgs=('aspnetcore-*' 'dotnet-*' 'llvm-*' 'php*' 'mongodb-*' 'mysql-*'
                        azure-cli google-chrome-stable firefox mono-devel)
         unwanted_dirs=(/usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL)
         # Start background removal operations as systemd units; if this causes
@@ -30,9 +31,12 @@ runs:
         for x in ${unwanted_dirs[@]}; do
           runcleanup rm -rf "$x"
         done
-        # Apt removals in foreground, as we can't parallelize these
+        # Apt removals in foreground, as we can't parallelize these.
+        # Only attempt removal if matching packages are installed.
         for x in ${unwanted_pkgs[@]}; do
-          /bin/time -f '%E %C' sudo apt-get remove -y $x
+          if dpkg -l "$x" >/dev/null 2>&1; then
+            /bin/time -f '%E %C' sudo apt-get remove -y "$x"
+          fi
         done
     # We really want support for heredocs
     - name: Update podman and install just
@@ -61,24 +65,15 @@ runs:
       id: set_arch
       shell: bash
       run: echo "ARCH=$(arch)" >> $GITHUB_ENV
-    # We often use Rust, so set up opinionated default caching
-    - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        cache-all-crates: true
-        # Only generate caches on push to git main
-        save-if: ${{ github.ref == 'refs/heads/main' }}
-        # Suppress actually using the cache for builds running from
-        # git main so that we avoid incremental compilation bugs
-        lookup-only: ${{ github.ref == 'refs/heads/main' }}
     # Install libvirt stack if requested
     - name: Install libvirt and virtualization stack
       if: ${{ inputs.libvirt == 'true' }}
       shell: bash
       run: |
         set -xeuo pipefail
-        export BCVK_VERSION=0.6.0
-        /bin/time -f '%E %C' sudo apt install -y libkrb5-dev pkg-config libvirt-dev genisoimage qemu-utils qemu-kvm virtiofsd libvirt-daemon-system
+        export BCVK_VERSION=0.10.0
+        # see https://github.com/bootc-dev/bcvk/issues/176
+        /bin/time -f '%E %C' sudo apt install -y libkrb5-dev pkg-config libvirt-dev genisoimage qemu-utils qemu-kvm virtiofsd libvirt-daemon-system python3-virt-firmware
         # Something in the stack is overriding this, but we want session right now for bcvk
         echo LIBVIRT_DEFAULT_URI=qemu:///session >> $GITHUB_ENV
         td=$(mktemp -d)
