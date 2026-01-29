@@ -19,8 +19,29 @@ jobs:
           cat /etc/os-release
           df -h
 
+      - name: Test plucky apt mirror fix
+        run: |
+          set -eux
+          # This is the proposed fix - use correct mirror per architecture
+          case "$(arch)" in
+            x86_64)
+              mirror="http://azure.archive.ubuntu.com/ubuntu"
+              ;;
+            aarch64)
+              mirror="http://ports.ubuntu.com/ubuntu-ports"
+              ;;
+            *)
+              echo "Unsupported architecture: $(arch)" >&2
+              exit 1
+              ;;
+          esac
+          echo "Using mirror: ${mirror}"
+          echo "deb ${mirror} plucky universe main" | sudo tee /etc/apt/sources.list.d/plucky.list
+          /bin/time -f '%E %C' sudo apt update
+          # Test that we can actually install packages from plucky
+          apt-cache policy podman
+
       - name: Setup upterm session
         uses: owenthereal/action-upterm@v1
         with:
-          # Limit session to 60 minutes max
           limit-access-to-actor: true
