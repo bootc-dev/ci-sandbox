@@ -19,29 +19,18 @@ jobs:
           cat /etc/os-release
           df -h
 
-      - name: Test plucky apt mirror fix
+      - name: Test local bootc-ubuntu-setup action
+        uses: ./.github/actions/bootc-ubuntu-setup
+
+      - name: Verify setup worked
         run: |
-          set -eux
-          # This is the proposed fix - use correct mirror per architecture
-          case "$(arch)" in
-            x86_64)
-              mirror="http://azure.archive.ubuntu.com/ubuntu"
-              ;;
-            aarch64)
-              mirror="http://ports.ubuntu.com/ubuntu-ports"
-              ;;
-            *)
-              echo "Unsupported architecture: $(arch)" >&2
-              exit 1
-              ;;
-          esac
-          echo "Using mirror: ${mirror}"
-          echo "deb ${mirror} plucky universe main" | sudo tee /etc/apt/sources.list.d/plucky.list
-          /bin/time -f '%E %C' sudo apt update
-          # Test that we can actually install packages from plucky
-          apt-cache policy podman
+          set -x
+          podman --version
+          just --version
+          echo "Setup completed successfully!"
 
       - name: Setup upterm session
+        if: failure()
         uses: owenthereal/action-upterm@v1
         with:
           limit-access-to-actor: true
