@@ -161,7 +161,7 @@ jobs:
 
       - name: Archive TMT logs
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: tmt-log-PR-${{ github.event.number }}-${{ matrix.test_os }}-ostree-${{ env.ARCH }}
           path: /var/tmp/tmt
@@ -227,7 +227,7 @@ jobs:
 
       - name: Archive TMT logs
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: tmt-log-PR-${{ github.event.number }}-${{ matrix.test_os }}-cfs-${{ env.ARCH }}
           path: /var/tmp/tmt
