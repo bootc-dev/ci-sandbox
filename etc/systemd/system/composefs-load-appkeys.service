@@ -1,0 +1,14 @@
+[Unit]
+Description=Load composefs app-signing cert into .fs-verity keyring
+DefaultDependencies=no
+After=local-fs.target
+Before=multi-user.target
+ConditionPathExists=/usr/lib/composefs/app-signing-cert.pem
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/composefs/load-app-keys.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

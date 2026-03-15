@@ -1,0 +1,137 @@
+name: Build sealed composefs demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_IMAGE: ghcr.io/${{ github.repository }}/sealed-app
+  HOST_IMAGE: ghcr.io/${{ github.repository }}/sealed-host
+  CFSCTL_IMAGE: ghcr.io/${{ github.repository }}/cfsctl:composefs
+
+jobs:
+  build-and-seal:
+    name: Build, seal, and push
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      # -- Install oras (used for fetching cfsctl and pushing referrer artifacts) --
+      - name: Install oras
+        run: |
+          ORAS_VERSION="1.3.1"
+          curl -sLO "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          tar xzf "oras_${ORAS_VERSION}_linux_amd64.tar.gz" -C /usr/local/bin oras
+          rm -f "oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          oras version
+
+      # -- Log in to GHCR (needed for pulling cfsctl artifact and pushing images) --
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # -- Fetch pre-built cfsctl from OCI artifact --
+      - name: Fetch cfsctl
+        run: |
+          oras pull ${CFSCTL_IMAGE}
+          chmod +x cfsctl
+          ./cfsctl --version
+          sudo cp cfsctl /usr/local/bin/cfsctl
+
+      # -- Build the app image --
+      - name: Build app image
+        run: podman build -f Containerfile.app -t localhost/sealed-app:latest .
+
+      # -- Seal, sign, and push (main branch only) --
+      - name: Write signing keys
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          COMPOSEFS_SIGNING_KEY: ${{ secrets.COMPOSEFS_SIGNING_KEY }}
+          COMPOSEFS_SIGNING_CERT: ${{ secrets.COMPOSEFS_SIGNING_CERT }}
+        run: |
+          mkdir -p /tmp/keys
+          printenv COMPOSEFS_SIGNING_KEY > /tmp/keys/composefs-signing.key
+          printenv COMPOSEFS_SIGNING_CERT > /tmp/keys/composefs-signing.pem
+
+      - name: Seal, sign, and export app image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          CFSCTL=cfsctl
+          REPO=/tmp/composefs-repo
+
+          echo "==> Initialize composefs repo"
+          "${CFSCTL}" --insecure --repo "${REPO}" init
+
+          echo "==> Pull app image into composefs repo"
+          IMAGE_ID=$(podman inspect --format '{{.Id}}' localhost/sealed-app:latest)
+          "${CFSCTL}" --insecure --repo "${REPO}" oci pull "containers-storage:${IMAGE_ID}" sealed-app
+
+          echo "==> Seal app image"
+          "${CFSCTL}" --insecure --repo "${REPO}" oci seal sealed-app
+
+          echo "==> Sign app image"
+          "${CFSCTL}" --insecure --repo "${REPO}" oci sign sealed-app \
+              --cert /tmp/keys/composefs-signing.pem \
+              --key /tmp/keys/composefs-signing.key
+
+          echo "==> Verify signature locally"
+          "${CFSCTL}" --insecure --repo "${REPO}" oci verify sealed-app \
+              --cert /tmp/keys/composefs-signing.pem
+
+          echo "==> Export to OCI layout (with signature referrers)"
+          "${CFSCTL}" --insecure --repo "${REPO}" oci push --signatures sealed-app /tmp/sealed-app-oci
+
+          echo "==> Inspect OCI layout"
+          cat /tmp/sealed-app-oci/index.json | python3 -m json.tool
+
+      - name: Push sealed app to GHCR (with referrers)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          oras cp --from-oci-layout -r /tmp/sealed-app-oci:sealed-app \
+            ${APP_IMAGE}:latest
+
+          echo "==> Verify referrers are discoverable"
+          oras discover --format tree ${APP_IMAGE}:latest
+
+      # -- Build and push the host image --
+      - name: Prepare signing cert for host build
+        run: |
+          if [ -f /tmp/keys/composefs-signing.pem ]; then
+            cp /tmp/keys/composefs-signing.pem app-signing-cert.pem
+          else
+            # PR builds: generate ephemeral cert for build validation only
+            openssl req -x509 -newkey rsa:2048 -nodes \
+              -keyout /dev/null -out app-signing-cert.pem \
+              -days 1 -subj '/CN=composefs-ci-ephemeral/'
+          fi
+
+      - name: Build host image
+        run: |
+          podman build -f Containerfile.host \
+            --build-arg SEALED_APP_IMAGE=docker://${APP_IMAGE}:latest \
+            --build-arg CFSCTL_IMAGE=${CFSCTL_IMAGE} \
+            -t localhost/sealed-host:latest .
+          rm -f app-signing-cert.pem
+
+      - name: Verify cfsctl in host image
+        run: podman run --rm localhost/sealed-host:latest cfsctl --version
+
+      - name: Push host image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: podman push localhost/sealed-host:latest docker://${HOST_IMAGE}:latest
+
+      - name: Clean up keys
+        if: always()
+        run: rm -rf /tmp/keys

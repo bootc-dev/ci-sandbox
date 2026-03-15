@@ -1,0 +1,13 @@
+# Configuration for sealed-httpd.service
+#
+# This value is injected at build time by Containerfile.host.
+# Override at deploy time to point at a different signed image.
+
+# Image to pull (OCI transport URI)
+SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
+
+# Container name used by crun
+SEALED_APP_NAME=sealed-httpd
+
+# composefs object store for app images
+COMPOSEFS_REPO=/var/lib/composefs/apps

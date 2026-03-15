@@ -1,0 +1,54 @@
+# Containerfile.host — Sealed bootc host image with composefs app signing
+#
+# CentOS Stream 10 bootc already ships the composefs dracut module,
+# composefs-setup-root, SELinux policy, and systemd-networkd config.
+# We only add: cfsctl, crun, and the app-signing certificate + loader.
+#
+# The composefs digest gets injected into the kernel cmdline by
+# `bootc install` at deploy time — the Containerfile just builds
+# the OS content layer.
+#
+# cfsctl is fetched as a pre-built OCI artifact via oras.
+
+ARG CFSCTL_IMAGE=ghcr.io/cgwalters/ci-sandbox/cfsctl:composefs
+FROM quay.io/centos/centos:stream10 AS fetch-cfsctl
+ARG CFSCTL_IMAGE
+RUN dnf -y install tar gzip && dnf clean all
+RUN curl -sLO "https://github.com/oras-project/oras/releases/download/v1.3.1/oras_1.3.1_linux_amd64.tar.gz" && \
+    tar xzf oras_1.3.1_linux_amd64.tar.gz oras && rm oras_1.3.1_linux_amd64.tar.gz
+RUN ./oras pull "${CFSCTL_IMAGE}" && chmod +x cfsctl
+
+FROM quay.io/centos-bootc/centos-bootc:stream10
+
+# The sealed app image to pull at boot (override via --build-arg)
+ARG SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
+
+# Install container runtime for running sealed app containers
+RUN dnf -y install crun && dnf clean all
+
+# Install cfsctl — pre-built binary fetched via oras
+COPY --from=fetch-cfsctl /cfsctl /usr/bin/cfsctl
+
+# Embed the composefs app-signing certificate (public key — not secret).
+# At boot, a systemd service loads this into the kernel .fs-verity keyring.
+COPY app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
+
+# Systemd service + script to load the signing cert into the kernel keyring
+COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
+COPY usr/lib/composefs/load-app-keys.sh /usr/lib/composefs/
+
+# Sealed httpd application service (pulls, mounts, and runs a signed app image)
+COPY etc/default/sealed-httpd /etc/default/sealed-httpd
+COPY etc/systemd/system/sealed-httpd.service /etc/systemd/system/
+COPY usr/lib/composefs/run-sealed-app.sh /usr/lib/composefs/
+COPY usr/lib/composefs/stop-sealed-app.sh /usr/lib/composefs/
+
+# Inject the actual app image reference into the environment file
+RUN sed -i "s|^SEALED_APP_IMAGE=.*|SEALED_APP_IMAGE=${SEALED_APP_IMAGE}|" \
+    /etc/default/sealed-httpd
+
+RUN chmod +x /usr/lib/composefs/load-app-keys.sh \
+             /usr/lib/composefs/run-sealed-app.sh \
+             /usr/lib/composefs/stop-sealed-app.sh && \
+    systemctl enable composefs-load-appkeys.service && \
+    systemctl enable sealed-httpd.service
