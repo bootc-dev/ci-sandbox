@@ -1,0 +1,57 @@
+# Build a CentOS Stream 10 kernel with fs-verity built-in signatures and
+# IPE (Integrity Policy Enforcement) enabled.
+#
+# The stock c10s kernel has CONFIG_FS_VERITY=y but the signature and IPE
+# options disabled. This build enables them and produces kernel RPMs
+# that can be layered into a bootc image.
+#
+# Build: podman build -f Containerfile -t localhost/kernel-fsverity:build .
+# Extract: podman run --rm localhost/kernel-fsverity:build \
+#            tar -C /out/ -cf - . | tar -C out/ -xvf -
+
+# --- Stage 1: Install build deps and fetch kernel SRPM ---
+FROM quay.io/centos/centos:stream10 AS buildroot
+
+RUN dnf -y install 'dnf-command(config-manager)' && \
+    dnf config-manager --set-enabled crb && \
+    dnf -y install rpm-build yum-utils && \
+    dnf -y builddep --skip-unavailable kernel && \
+    dnf clean all
+
+RUN dnf download --source kernel && \
+    rpm -ivh kernel-*.src.rpm && \
+    rm -f kernel-*.src.rpm
+
+# --- Stage 2: Patch config and build ---
+FROM buildroot AS build
+
+COPY enable-configs.sh /tmp/enable-configs.sh
+
+# Enable our config options in the flat config files, and set a custom
+# buildid so the resulting RPMs are distinguishable from stock.
+RUN chmod +x /tmp/enable-configs.sh && \
+    /tmp/enable-configs.sh && \
+    sed -i 's/^# define buildid .local/%define buildid .fsverity/' \
+        ~/rpmbuild/SPECS/kernel.spec
+
+# Build only the base kernel flavour (no debug, no RT, no docs, no tools).
+# Even trimmed down this takes 20-40 minutes depending on the machine.
+RUN cd ~/rpmbuild/SPECS && \
+    rpmbuild -bb \
+        --without debug \
+        --without debuginfo \
+        --without doc \
+        --without perf \
+        --without libperf \
+        --without tools \
+        --without bpftool \
+        --without selftests \
+        --without headers \
+        --without cross_headers \
+        --target x86_64 \
+        kernel.spec
+
+# --- Stage 3: Collect output RPMs ---
+FROM quay.io/centos/centos:stream10 AS output
+COPY --from=build /root/rpmbuild/RPMS/x86_64/kernel-*.rpm /out/
+RUN ls -lh /out/

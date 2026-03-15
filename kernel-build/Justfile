@@ -1,0 +1,23 @@
+# Justfile for custom kernel build
+
+# Build the kernel RPMs in a container
+build:
+    podman build -f Containerfile -t localhost/kernel-fsverity:build .
+    mkdir -p out/
+    podman run --rm localhost/kernel-fsverity:build tar -C /out/ -cf - . | tar -C out/ -xvf -
+    echo "RPMs in out/"
+    ls -la out/
+
+# Push kernel RPMs as OCI artifact
+push: build
+    #!/bin/bash
+    set -euo pipefail
+    cd out/
+    oras push ghcr.io/cgwalters/ci-sandbox/kernel-fsverity:stream10 \
+        --artifact-type application/vnd.composefs.kernel-rpms.v1 \
+        *.rpm
+    echo "Pushed kernel RPMs to ghcr.io/cgwalters/ci-sandbox/kernel-fsverity:stream10"
+
+clean:
+    rm -rf out/
+    podman rmi localhost/kernel-fsverity:build 2>/dev/null || true
