@@ -1,12 +1,8 @@
 # Justfile for sealed composefs demo
 #
-# Builds a CentOS Stream 10 bootc host with composefs app-signing keys
-# and a sealed httpd application container verified at mount time.
-#
-# CentOS Stream 10 bootc already includes composefs support (dracut module,
-# composefs-setup-root, SELinux policy, systemd-networkd). We add cfsctl
-# (built from source inside the container build), crun, and the app-signing
-# certificate.
+# Builds a CentOS Stream 10 bootc host that boots with the composefs
+# backend (UKI + composefs digest + Secure Boot) and runs sealed
+# application containers verified by fs-verity signatures.
 #
 # Prerequisites: podman, openssl, just
 # For sealing: cargo (builds cfsctl locally for the seal-app step)
@@ -22,36 +18,30 @@ app_image := "localhost/sealed-app:latest"
 # Key material and build artifacts
 keys_dir := justfile_directory() + "/target/keys"
 
-# Generate composefs signing keypair
+# Generate all signing keypairs (composefs + Secure Boot)
 keygen:
     #!/bin/bash
     set -euo pipefail
-    mkdir -p "{{keys_dir}}"
-    if [ -f "{{keys_dir}}/composefs-signing.key" ]; then
-        echo "Signing keypair already exists in {{keys_dir}}, skipping"
-        exit 0
-    fi
-    openssl req -x509 -newkey rsa:4096 -nodes \
-        -keyout "{{keys_dir}}/composefs-signing.key" \
-        -out "{{keys_dir}}/composefs-signing.pem" \
-        -days 3650 -subj '/CN=composefs-app-signing/O=composefs-demo'
-    echo "Generated composefs signing keypair in {{keys_dir}}"
+    python3 util/keys.py generate --output-dir "{{keys_dir}}"
+    # Copy public certs to keys/ for committing
+    mkdir -p keys/
+    cp "{{keys_dir}}/sb-db.crt" keys/
+    cp "{{keys_dir}}/composefs-signing.pem" keys/app-signing-cert.pem
+    echo "Public certs copied to keys/ — commit them to the repo"
 
 # Build cfsctl from composefs-rs source (for local seal/sign operations)
 build-cfsctl:
     cargo build --release --manifest-path "{{composefs_src}}/Cargo.toml" \
         -p cfsctl --features composefs-oci/oci-client
 
-# Build the sealed host image
-#
-# cfsctl is built from source INSIDE the container build (multi-stage).
-# By default clones from cgwalters/ci-sandbox composefs branch; override
-# with COMPOSEFS_RS_REPO/COMPOSEFS_RS_REF env vars for local dev.
+# Build the sealed host image (composefs backend with signed UKI)
 build-host: keygen
     #!/bin/bash
     set -euo pipefail
     cp "{{keys_dir}}/composefs-signing.pem" app-signing-cert.pem
     podman build -f Containerfile.host \
+        --secret id=secureboot_key,src="{{keys_dir}}/sb-db.key" \
+        --secret id=secureboot_cert,src="{{keys_dir}}/sb-db.crt" \
         -t "{{host_image}}" .
     rm -f app-signing-cert.pem
     echo "Host image built: {{host_image}}"
@@ -89,8 +79,8 @@ seal-app: keygen build-cfsctl build-app
 
     echo "App image sealed and signed successfully"
 
-# Boot a VM and verify the sealed app service works e2e.
-# Uses default ostree boot mode (--composefs-backend is not yet reliable).
+# Boot a VM with the composefs backend and verify e2e.
+# The VM uses Secure Boot with our enrolled keys.
 bcvk-ssh: build-host
     #!/bin/bash
     set -euo pipefail
@@ -103,6 +93,7 @@ bcvk-ssh: build-host
     echo "==> Booting sealed host VM..."
     bcvk libvirt run --detach --ssh-wait --name "${VM_NAME}" \
         --filesystem=ext4 \
+        --secure-boot-keys "{{keys_dir}}" \
         "{{host_image}}"
 
     echo "==> Waiting for multi-user.target (timeout 120s)..."
@@ -115,8 +106,19 @@ bcvk-ssh: build-host
         set -euo pipefail
         failed=0
 
+        echo "--- kernel ---"
+        uname -r
+
         echo "--- cfsctl version ---"
         cfsctl --version
+
+        echo "--- root mount ---"
+        mount | grep " / " || true
+        if mount | grep -q composefs; then
+            echo "  OK: composefs root"
+        else
+            echo "  INFO: root mount (check composefs status)"
+        fi
 
         echo "--- composefs-load-appkeys.service ---"
         if systemctl is-active --quiet composefs-load-appkeys.service; then
@@ -131,7 +133,6 @@ bcvk-ssh: build-host
         echo "--- sealed-httpd.service ---"
         if systemctl is-active --quiet sealed-httpd.service; then
             echo "  OK: sealed-httpd active"
-            # Verify httpd is actually serving
             if curl -sf http://localhost/ | grep -q "sealed"; then
                 echo "  OK: httpd serving sealed demo page"
             else

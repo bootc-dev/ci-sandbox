@@ -54,17 +54,22 @@ jobs:
       - name: Build app image
         run: podman build -f Containerfile.app -t localhost/sealed-app:latest .
 
-      # -- Seal, sign, and push (main branch only) --
+      # -- Write all signing keys (main branch only) --
       - name: Write signing keys
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           COMPOSEFS_SIGNING_KEY: ${{ secrets.COMPOSEFS_SIGNING_KEY }}
           COMPOSEFS_SIGNING_CERT: ${{ secrets.COMPOSEFS_SIGNING_CERT }}
+          SECUREBOOT_DB_KEY: ${{ secrets.SECUREBOOT_DB_KEY }}
+          SECUREBOOT_DB_CERT: ${{ secrets.SECUREBOOT_DB_CERT }}
         run: |
           mkdir -p /tmp/keys
           printenv COMPOSEFS_SIGNING_KEY > /tmp/keys/composefs-signing.key
           printenv COMPOSEFS_SIGNING_CERT > /tmp/keys/composefs-signing.pem
+          printenv SECUREBOOT_DB_KEY > /tmp/keys/sb-db.key
+          printenv SECUREBOOT_DB_CERT > /tmp/keys/sb-db.crt
 
+      # -- Seal, sign, and export app image --
       - name: Seal, sign, and export app image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
@@ -105,21 +110,26 @@ jobs:
           echo "==> Verify referrers are discoverable"
           oras discover --format tree ${APP_IMAGE}:latest
 
-      # -- Build and push the host image --
-      - name: Prepare signing cert for host build
+      # -- Build the sealed host image (composefs backend with UKI) --
+      - name: Prepare keys for host build
         run: |
           if [ -f /tmp/keys/composefs-signing.pem ]; then
             cp /tmp/keys/composefs-signing.pem app-signing-cert.pem
           else
-            # PR builds: generate ephemeral cert for build validation only
+            # PR builds: generate ephemeral keys for build validation only
+            openssl req -x509 -newkey rsa:2048 -nodes \
+              -keyout /tmp/keys/sb-db.key -out /tmp/keys/sb-db.crt \
+              -days 1 -subj '/CN=composefs-ci-ephemeral-db/'
             openssl req -x509 -newkey rsa:2048 -nodes \
               -keyout /dev/null -out app-signing-cert.pem \
               -days 1 -subj '/CN=composefs-ci-ephemeral/'
           fi
 
-      - name: Build host image
+      - name: Build sealed host image
         run: |
           podman build -f Containerfile.host \
+            --secret id=secureboot_key,src=/tmp/keys/sb-db.key \
+            --secret id=secureboot_cert,src=/tmp/keys/sb-db.crt \
             --build-arg SEALED_APP_IMAGE=docker://${APP_IMAGE}:latest \
             --build-arg CFSCTL_IMAGE=${CFSCTL_IMAGE} \
             -t localhost/sealed-host:latest .
