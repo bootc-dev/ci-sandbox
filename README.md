@@ -1,5 +1,16 @@
 # Sealed composefs containers: an OCI integrity demo
 
+This is intending to get PoC level work to show https://github.com/composefs/composefs-rs/pull/226
+running truly end to end.
+
+All of the remaining text below and the rest of this directory
+is LLM generated and only lightly validated.
+
+---
+
+🤖 Assisted-by: OpenCode (Claude Opus 4)
+
+
 This demo shows composefs providing end-to-end integrity for OCI
 container images — from registry to running workload — using standard
 OCI distribution primitives. A CentOS Stream 10 bootc host pulls a
