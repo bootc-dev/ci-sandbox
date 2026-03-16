@@ -61,6 +61,25 @@ RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
 RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
     rpm -e bootupd 2>/dev/null || true
 
+# Default to ext4 (supports fsverity, required for composefs)
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    mkdir -p /usr/lib/bootc/install && \
+    cat > /usr/lib/bootc/install/00-composefs.toml <<'EOF'
+[install.filesystem.root]
+type = "ext4"
+EOF
+
+# Sign systemd-boot with our Secure Boot key so UEFI firmware will load it.
+# This must happen BEFORE the flatten so the signed binary is in the digest.
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=secret,id=secureboot_key \
+    --mount=type=secret,id=secureboot_cert \
+    sbsign --key /run/secrets/secureboot_key \
+           --cert /run/secrets/secureboot_cert \
+           --output /tmp/systemd-bootx64.efi.signed \
+           /usr/lib/systemd/boot/efi/systemd-bootx64.efi && \
+    mv /tmp/systemd-bootx64.efi.signed /usr/lib/systemd/boot/efi/systemd-bootx64.efi
+
 # --- Stage: base (flatten to single layer for deterministic digests) ---
 # This is the workaround for composefs-rs#132: podman's overlayfs
 # layer stitching produces nondeterministic directory timestamps.
@@ -75,13 +94,21 @@ CMD ["/sbin/init"]
 
 # --- Stage: kernel (compute digest + build signed UKI) ---
 FROM base AS kernel
+# Compute composefs digest and build signed UKI
 RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
     --mount=type=bind,from=base,target=/target \
     --mount=type=secret,id=secureboot_key \
     --mount=type=secret,id=secureboot_cert <<EORUN
 set -xeuo pipefail
 mkdir -p /out
-bootc container ukify --rootfs /target -- \
+# SELinux must be permissive for sealed UKI boot (bootc#1826).
+# console=ttyS0 enables serial console for debugging.
+bootc container ukify --rootfs /target \
+  --karg enforcing=0 \
+  --karg console=tty0 \
+  --karg console=ttyS0,115200n8 \
+  --karg console=hvc0,115200 \
+  -- \
   --signtool sbsign \
   --secureboot-private-key /run/secrets/secureboot_key \
   --secureboot-certificate /run/secrets/secureboot_cert \
