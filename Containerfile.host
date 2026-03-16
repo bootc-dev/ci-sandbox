@@ -1,15 +1,14 @@
 # Containerfile.host — Sealed bootc host with composefs root + app signing
 #
-# This builds a bootc image that boots with the composefs backend:
-# - A composefs digest of the root filesystem is computed at build time
-# - A UKI (Unified Kernel Image) embeds the digest in the kernel cmdline
-# - The UKI is signed with Secure Boot keys for end-to-end trust
+# Pattern follows composefs-rs examples/unified-secureboot:
+# 1. Base stage: install all packages
+# 2. Kernel stage: bind-mount base, compute composefs digest, build signed UKI
+# 3. Final stage: COPY /boot from kernel stage
 #
-# At boot, composefs verifies every file's fs-verity digest against the
-# signed manifest, providing full root filesystem integrity.
-#
-# In addition to the sealed root, the image carries cfsctl and an
-# app-signing certificate for running sealed application containers.
+# The final image has the same rootfs content as `base` plus /boot from
+# the kernel stage. bootc install puts /boot on the ESP (separate from
+# the composefs-verified rootfs), so the digest computed against `base`
+# matches what bootc install computes from the container.
 #
 # Build:
 #   podman build -f Containerfile.host \
@@ -27,87 +26,74 @@ RUN curl -sLO "https://github.com/oras-project/oras/releases/download/v1.3.1/ora
     tar xzf oras_1.3.1_linux_amd64.tar.gz oras && rm oras_1.3.1_linux_amd64.tar.gz
 RUN ./oras pull "${CFSCTL_IMAGE}" && chmod +x cfsctl
 
-# --- Stage: rootfs (the actual OS content) ---
-FROM quay.io/centos-bootc/centos-bootc:stream10 AS rootfs
+# --- Stage: rootfs-builder (install packages on the bootc base) ---
+FROM quay.io/centos-bootc/centos-bootc:stream10 AS rootfs-builder
 
-# The sealed app image to pull at boot (override via --build-arg)
 ARG SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
 
-# Install container runtime and UKI tools
-RUN dnf -y install crun && dnf clean all
+# sbsigntools from EPEL; systemd-boot-unsigned for bootctl install
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    dnf -y install epel-release && \
+    dnf -y install crun systemd-boot-unsigned systemd-ukify sbsigntools && \
+    dnf clean all
 
-# Install cfsctl
 COPY --from=fetch-cfsctl /cfsctl /usr/bin/cfsctl
 
-# Embed the composefs app-signing certificate (public key — not secret).
-# At boot, a systemd service loads this into the kernel .fs-verity keyring.
+# App-signing certificate + services
 COPY app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
-
-# Systemd service + script to load the signing cert into the kernel keyring
 COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
 COPY usr/lib/composefs/load-app-keys.sh /usr/lib/composefs/
-
-# Sealed httpd application service
 COPY etc/default/sealed-httpd /etc/default/sealed-httpd
 COPY etc/systemd/system/sealed-httpd.service /etc/systemd/system/
 COPY usr/lib/composefs/run-sealed-app.sh /usr/lib/composefs/
 COPY usr/lib/composefs/stop-sealed-app.sh /usr/lib/composefs/
 
-# Inject the actual app image reference into the environment file
-RUN sed -i "s|^SEALED_APP_IMAGE=.*|SEALED_APP_IMAGE=${SEALED_APP_IMAGE}|" \
-    /etc/default/sealed-httpd
-
-RUN chmod +x /usr/lib/composefs/load-app-keys.sh \
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    sed -i "s|^SEALED_APP_IMAGE=.*|SEALED_APP_IMAGE=${SEALED_APP_IMAGE}|" \
+    /etc/default/sealed-httpd && \
+    chmod +x /usr/lib/composefs/load-app-keys.sh \
              /usr/lib/composefs/run-sealed-app.sh \
              /usr/lib/composefs/stop-sealed-app.sh && \
     systemctl enable composefs-load-appkeys.service && \
     systemctl enable sealed-httpd.service
 
-# Remove bootupd — the composefs backend uses systemd-boot, not grub
-RUN rpm -e bootupd 2>/dev/null || true
+# composefs backend uses systemd-boot, not grub/bootupd
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    rpm -e bootupd 2>/dev/null || true
 
-# --- Stage: generate sealed UKI ---
-# Compute the composefs digest from the rootfs and build a signed UKI.
-# We use the rootfs itself (which has bootc) plus ukify for the build.
-FROM rootfs AS sealed-uki
+# --- Stage: base (flatten to single layer for deterministic digests) ---
+# This is the workaround for composefs-rs#132: podman's overlayfs
+# layer stitching produces nondeterministic directory timestamps.
+# Flattening via FROM scratch + COPY eliminates all layer boundaries.
+FROM scratch AS base
+COPY --from=rootfs-builder / /
+LABEL containers.bootc 1
+LABEL ostree.bootable 1
+ENV container=oci
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
 
-RUN dnf -y install systemd-ukify sbsigntools && dnf clean all
-
-RUN --mount=type=bind,from=rootfs,target=/target \
+# --- Stage: kernel (compute digest + build signed UKI) ---
+FROM base AS kernel
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=base,target=/target \
     --mount=type=secret,id=secureboot_key \
     --mount=type=secret,id=secureboot_cert <<EORUN
-set -euo pipefail
-
-# Compute the composefs digest from the mounted rootfs
-digest=$(bootc container compute-composefs-digest /target)
-echo "composefs digest: ${digest}"
-
-# Find the kernel version
-kver=$(ls /target/usr/lib/modules)
-echo "kernel: ${kver}"
-
-# Generate and sign the UKI with the composefs digest embedded
+set -xeuo pipefail
 mkdir -p /out
-ukify build \
-  --linux "/target/usr/lib/modules/${kver}/vmlinuz" \
-  --initrd "/target/usr/lib/modules/${kver}/initramfs.img" \
-  --cmdline "composefs=${digest} rw" \
-  --os-release "@/target/usr/lib/os-release" \
+bootc container ukify --rootfs /target -- \
   --signtool sbsign \
   --secureboot-private-key /run/secrets/secureboot_key \
   --secureboot-certificate /run/secrets/secureboot_cert \
-  --output "/out/${kver}.efi"
-
-echo "UKI built: /out/${kver}.efi"
+  --output /out/uki.efi
+ls -lh /out/
 EORUN
+# Move the UKI into /boot with the right name
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    kver=$(bootc container inspect --json | jq -r '.kernel.version') && \
+    mkdir -p /boot/EFI/Linux && \
+    mv /out/uki.efi "/boot/EFI/Linux/${kver}.efi"
 
-# --- Final image: rootfs with the sealed UKI ---
-FROM rootfs
-
-# Copy the signed UKI into place
-COPY --from=sealed-uki /out/*.efi /boot/EFI/Linux/
-
-# Remove the raw vmlinuz and initramfs — they're embedded in the UKI
-RUN for kver in /usr/lib/modules/*/; do \
-      rm -f "${kver}/vmlinuz" "${kver}/initramfs.img"; \
-    done
+# --- Final image: base rootfs + /boot from kernel stage ---
+FROM base
+COPY --from=kernel /boot /boot
