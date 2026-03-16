@@ -1,25 +1,47 @@
-# Custom Kernel Build: fs-verity + IPE
+# Custom Kernel Build: composefs-IPE integration
 
-This builds a CentOS Stream 10 kernel RPM with additional security config
-options enabled that are not on by default in the distribution kernel.
+This builds a CentOS Stream 10 kernel RPM with composefs-IPE integration
+patches and additional security config options enabled.
 
 ## What gets enabled
 
-- **`CONFIG_FS_VERITY_BUILTIN_SIGNATURES`** — allows the kernel to verify
-  fs-verity file digests against built-in X.509 certificates. This is the
-  foundation for content-trust at the filesystem level.
-- **`CONFIG_SECURITY_IPE`** — Integrity Policy Enforcement, a Linux Security
-  Module that can enforce policies based on file integrity properties
-  (including fs-verity).
-- **`CONFIG_IPE_PROP_FS_VERITY`** / **`CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG`**
-  — IPE policy properties for fs-verity digest and signature checks.
+Config overrides (via `kernel-local`):
 
-## Why
+- **`CONFIG_FS_VERITY_BUILTIN_SIGNATURES`** — kernel-level verification of
+  fs-verity file digests against built-in X.509 certificates
+- **`CONFIG_SECURITY_IPE`** — Integrity Policy Enforcement LSM
+- **`CONFIG_IPE_PROP_OVL_VERITY`** — IPE property for overlay verity validation
+  (from our patches below)
 
-The stock CentOS Stream 10 kernel has `CONFIG_FS_VERITY=y` but does not enable
-the built-in signature support or IPE. These are needed for composefs-based
-integrity enforcement where the system verifies file content against known
-fs-verity digests at open time.
+## Patches
+
+Two kernel patches wire up composefs/overlayfs to IPE:
+
+1. **`0001-overlayfs-lsm-Notify-LSMs-when-overlay-verity-valida.patch`** —
+   adds `LSM_INT_OVL_VERITY_VALIDATED` and calls `security_inode_setintegrity()`
+   after overlayfs successfully validates a metacopy file's fs-verity digest.
+
+2. **`0002-ipe-Add-overlay_verity_validated-property-for-compos.patch`** —
+   adds the `overlay_verity_validated=TRUE/FALSE` property to IPE policies,
+   letting admins write rules like:
+   ```
+   op=EXECUTE overlay_verity_validated=TRUE action=ALLOW
+   ```
+
+Together these enable the composefs trust chain: a signed EROFS metadata
+image records per-file fs-verity digests, overlayfs enforces them with
+`verity=require`, and IPE gates execution based on that verification.
+
+## Build approach
+
+This works as a **dist-git overlay** on top of the c10s kernel SRPM:
+
+- **Patches** are registered via the spec's `# END OF PATCH DEFINITIONS`
+  and `# END OF PATCH APPLICATIONS` sentinel comments (the same mechanism
+  the distro uses for `linux-kernel-test.patch`)
+- **Config** is injected via `kernel-local` (Source3001), the distro's
+  intended user-override file — no need to modify arch-specific configs
+- **Build ID** is set to `.fsverity` to distinguish from stock
 
 ## Building
 
@@ -27,22 +49,14 @@ fs-verity digests at open time.
 just build
 ```
 
-This runs a multi-stage container build (~30-60 minutes depending on hardware)
-and extracts the resulting RPMs into `out/`.
+Runs a multi-stage container build (~30-60 minutes) and extracts RPMs
+into `out/`.
 
 ## Using the output
 
-The `out/` directory will contain `kernel-*.rpm` packages. Install them into a
-bootc container image via `rpm-ostree install` or `dnf install` in your
-Containerfile:
+Install into a bootc container image:
 
 ```dockerfile
 COPY out/kernel-core-*.rpm out/kernel-modules-*.rpm /tmp/rpms/
 RUN dnf install -y /tmp/rpms/*.rpm && rm -rf /tmp/rpms/
-```
-
-Or push them as an OCI artifact for later consumption:
-
-```sh
-just push
 ```

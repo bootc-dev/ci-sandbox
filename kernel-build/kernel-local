@@ -1,0 +1,21 @@
+# kernel-local: composefs-IPE config overrides
+#
+# This file is picked up by the c10s kernel build system via Source3001
+# and merged into the config pipeline via process_configs.sh. It replaces
+# the need to patch individual arch config files.
+
+# fs-verity built-in signature verification
+CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y
+
+# IPE (Integrity Policy Enforcement) LSM
+CONFIG_SECURITY_IPE=y
+
+# IPE trust providers — auto-selected by Kconfig when dependencies
+# are met, but be explicit for clarity
+CONFIG_IPE_PROP_FS_VERITY=y
+CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG=y
+CONFIG_IPE_PROP_DM_VERITY=y
+CONFIG_IPE_PROP_DM_VERITY_SIGNATURE=y
+CONFIG_IPE_PROP_OVL_VERITY=y
+CONFIG_IPE_POLICY_SIG_SECONDARY_KEYRING=y
+CONFIG_IPE_POLICY_SIG_PLATFORM_KEYRING=y
