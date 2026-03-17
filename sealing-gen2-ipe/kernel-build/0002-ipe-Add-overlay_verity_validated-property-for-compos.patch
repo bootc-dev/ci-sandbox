@@ -1,0 +1,448 @@
+From 3a563e1fe20187a590339deb56bf0fba4719bb68 Mon Sep 17 00:00:00 2001
+From: Colin Walters <walters@verbum.org>
+Date: Mon, 16 Mar 2026 01:44:42 +0000
+Subject: [PATCH 2/2] ipe: Add overlay_verity_validated property for composefs
+ trust
+
+Add a new IPE property 'overlay_verity_validated' that evaluates to TRUE
+when a file is accessed through an overlayfs mount where the overlay's
+verity validation has confirmed the file's content matches the fs-verity
+digest recorded in the metadata layer.
+
+This enables IPE policies for composefs-style integrity: a signed EROFS
+metadata image records per-file fs-verity digests, overlayfs enforces
+them with verity=require, and IPE gates execution based on successful
+validation. An example policy rule:
+
+  op=EXECUTE overlay_verity_validated=TRUE action=ALLOW
+  DEFAULT op=EXECUTE action=DENY
+
+Key design decisions:
+- The ipe_eval_ctx carries both the data inode (d_real_inode, used for
+  fsverity_digest/fsverity_signature) and the overlay inode (used for
+  overlay_verity_validated), as these are different inodes
+- DCACHE_OP_REAL identifies stacked filesystem dentries; non-overlay
+  inodes have the flag zero-initialized so the property fails safe
+- The ovl_verity_validated bool transitions monotonically false->true
+  and uses WRITE_ONCE/READ_ONCE for lock-free read-side access
+- Lower layers are assumed immutable (the composefs model)
+
+Includes KUnit test cases for policy parsing of the new property.
+
+Assisted-by: OpenCode (Claude Opus 4)
+---
+ security/ipe/Kconfig         | 19 +++++++++
+ security/ipe/audit.c         |  2 +
+ security/ipe/eval.c          | 82 ++++++++++++++++++++++++++++++++++++
+ security/ipe/eval.h          | 13 +++++-
+ security/ipe/hooks.c         | 23 ++++++++--
+ security/ipe/hooks.h         |  5 ++-
+ security/ipe/ipe.c           | 15 ++++---
+ security/ipe/ipe.h           |  5 ++-
+ security/ipe/policy.h        |  2 +
+ security/ipe/policy_parser.c |  4 ++
+ security/ipe/policy_tests.c  | 23 +++++++++-
+ 11 files changed, 176 insertions(+), 17 deletions(-)
+
+diff --git a/security/ipe/Kconfig b/security/ipe/Kconfig
+index a110a6cd8..a61376f89 100644
+--- a/security/ipe/Kconfig
++++ b/security/ipe/Kconfig
+@@ -13,6 +13,7 @@ menuconfig SECURITY_IPE
+ 	select IPE_PROP_DM_VERITY_SIGNATURE if DM_VERITY && DM_VERITY_VERIFY_ROOTHASH_SIG
+ 	select IPE_PROP_FS_VERITY if FS_VERITY
+ 	select IPE_PROP_FS_VERITY_BUILTIN_SIG if FS_VERITY && FS_VERITY_BUILTIN_SIGNATURES
++	select IPE_PROP_OVL_VERITY if OVERLAY_FS && FS_VERITY
+ 	help
+ 	  This option enables the Integrity Policy Enforcement LSM
+ 	  allowing users to define a policy to enforce a trust-based access
+@@ -95,6 +96,24 @@ config IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 
+ 	  if unsure, answer Y.
+ 
++config IPE_PROP_OVL_VERITY
++	bool "Enable support for overlay verity validated files"
++	depends on OVERLAY_FS && FS_VERITY
++	help
++	  This option enables the 'overlay_verity_validated' property within
++	  IPE policies. The property evaluates to TRUE when a file is
++	  accessed through an overlayfs mount with verity=require and the
++	  overlay has verified that the file's content matches the fs-verity
++	  digest recorded in the metadata layer.
++
++	  This is the foundation for composefs-style integrity: a signed
++	  EROFS metadata image records per-file fs-verity digests, overlayfs
++	  enforces them, and IPE can gate execution on that verification.
++	  The lower filesystem layers are assumed to be immutable or
++	  read-only (which is the composefs model).
++
++	  If unsure, say Y.
++
+ endmenu
+ 
+ config SECURITY_IPE_KUNIT_TEST
+diff --git a/security/ipe/audit.c b/security/ipe/audit.c
+index 3f0deeb54..07cb44a6f 100644
+--- a/security/ipe/audit.c
++++ b/security/ipe/audit.c
+@@ -62,6 +62,8 @@ static const char *const audit_prop_names[__IPE_PROP_MAX] = {
+ 	"fsverity_digest=",
+ 	"fsverity_signature=FALSE",
+ 	"fsverity_signature=TRUE",
++	"overlay_verity_validated=FALSE",
++	"overlay_verity_validated=TRUE",
+ };
+ 
+ /**
+diff --git a/security/ipe/eval.c b/security/ipe/eval.c
+index 21439c5be..0854bf702 100644
+--- a/security/ipe/eval.c
++++ b/security/ipe/eval.c
+@@ -82,6 +82,39 @@ static void build_ipe_inode_ctx(struct ipe_eval_ctx *ctx, const struct inode *co
+ }
+ #endif /* CONFIG_IPE_PROP_FS_VERITY */
+ 
++#ifdef CONFIG_IPE_PROP_OVL_VERITY
++/**
++ * build_ipe_ovl_ctx() - Build overlay verity fields of an evaluation context.
++ * @ctx: Supplies a pointer to the context to be populated.
++ * @file: Supplies the file struct of the file triggered IPE event.
++ *
++ * If the file is on an overlayfs mount, record the overlay inode's IPE blob
++ * so we can check if overlay verity validation has been performed.
++ */
++static void build_ipe_ovl_ctx(struct ipe_eval_ctx *ctx,
++			      const struct file *const file)
++{
++	struct inode *ovl_ino = d_inode(file->f_path.dentry);
++
++	/*
++	 * Check for a stacked filesystem via DCACHE_OP_REAL. Currently
++	 * only overlayfs sets this flag. For non-overlay inodes, the
++	 * ovl_verity_validated flag in the IPE blob will be zero-initialized
++	 * (false), so the property fails safe (denies execution). The
++	 * ipe_ovl_inode blob is from the overlay inode (what the process
++	 * sees), NOT the d_real_inode() data inode used for fsverity_digest
++	 * and fsverity_signature properties.
++	 */
++	if (file->f_path.dentry->d_flags & DCACHE_OP_REAL)
++		ctx->ipe_ovl_inode = ipe_inode(ovl_ino);
++}
++#else
++static inline void build_ipe_ovl_ctx(struct ipe_eval_ctx *ctx,
++				     const struct file *const file)
++{
++}
++#endif /* CONFIG_IPE_PROP_OVL_VERITY */
++
+ /**
+  * ipe_build_eval_ctx() - Build an ipe evaluation context.
+  * @ctx: Supplies a pointer to the context to be populated.
+@@ -105,6 +138,7 @@ void ipe_build_eval_ctx(struct ipe_eval_ctx *ctx,
+ 		ino = d_real_inode(file->f_path.dentry);
+ 		build_ipe_bdev_ctx(ctx, ino);
+ 		build_ipe_inode_ctx(ctx, ino);
++		build_ipe_ovl_ctx(ctx, file);
+ 	}
+ }
+ 
+@@ -265,6 +299,50 @@ static bool evaluate_fsv_sig_true(const struct ipe_eval_ctx *const ctx)
+ }
+ #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
+ 
++#ifdef CONFIG_IPE_PROP_OVL_VERITY
++/**
++ * evaluate_ovl_verity_false() - Evaluate @ctx for overlay verity false.
++ * @ctx: Supplies a pointer to the context being evaluated.
++ *
++ * The ovl_verity_validated flag transitions monotonically from false to true
++ * (never cleared), and fails closed (false → deny execution). READ_ONCE
++ * ensures we see a consistent value despite the flag being set without
++ * holding any lock on the read side.
++ *
++ * Return:
++ * * %true	- The file is NOT overlay-verity validated
++ * * %false	- The file IS overlay-verity validated
++ */
++static bool evaluate_ovl_verity_false(const struct ipe_eval_ctx *const ctx)
++{
++	return !ctx->ipe_ovl_inode ||
++	       !READ_ONCE(ctx->ipe_ovl_inode->ovl_verity_validated);
++}
++
++/**
++ * evaluate_ovl_verity_true() - Evaluate @ctx for overlay verity true.
++ * @ctx: Supplies a pointer to the context being evaluated.
++ *
++ * Return:
++ * * %true	- The file IS overlay-verity validated
++ * * %false	- The file is NOT overlay-verity validated
++ */
++static bool evaluate_ovl_verity_true(const struct ipe_eval_ctx *const ctx)
++{
++	return !evaluate_ovl_verity_false(ctx);
++}
++#else
++static bool evaluate_ovl_verity_false(const struct ipe_eval_ctx *const ctx)
++{
++	return false;
++}
++
++static bool evaluate_ovl_verity_true(const struct ipe_eval_ctx *const ctx)
++{
++	return false;
++}
++#endif /* CONFIG_IPE_PROP_OVL_VERITY */
++
+ /**
+  * evaluate_property() - Analyze @ctx against a rule property.
+  * @ctx: Supplies a pointer to the context to be evaluated.
+@@ -297,6 +375,10 @@ static bool evaluate_property(const struct ipe_eval_ctx *const ctx,
+ 		return evaluate_fsv_sig_false(ctx);
+ 	case IPE_PROP_FSV_SIG_TRUE:
+ 		return evaluate_fsv_sig_true(ctx);
++	case IPE_PROP_OVL_VERITY_FALSE:
++		return evaluate_ovl_verity_false(ctx);
++	case IPE_PROP_OVL_VERITY_TRUE:
++		return evaluate_ovl_verity_true(ctx);
+ 	default:
+ 		return false;
+ 	}
+diff --git a/security/ipe/eval.h b/security/ipe/eval.h
+index fef65a364..72504dcf7 100644
+--- a/security/ipe/eval.h
++++ b/security/ipe/eval.h
+@@ -31,11 +31,17 @@ struct ipe_bdev {
+ };
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ struct ipe_inode {
++#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 	bool fs_verity_signed;
+-};
+ #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#ifdef CONFIG_IPE_PROP_OVL_VERITY
++	bool ovl_verity_validated;
++#endif /* CONFIG_IPE_PROP_OVL_VERITY */
++};
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+ 
+ struct ipe_eval_ctx {
+ 	enum ipe_op_type op;
+@@ -52,6 +58,9 @@ struct ipe_eval_ctx {
+ #ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 	const struct ipe_inode *ipe_inode;
+ #endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#ifdef CONFIG_IPE_PROP_OVL_VERITY
++	const struct ipe_inode *ipe_ovl_inode;
++#endif /* CONFIG_IPE_PROP_OVL_VERITY */
+ };
+ 
+ enum ipe_match {
+diff --git a/security/ipe/hooks.c b/security/ipe/hooks.c
+index 0ae54a880..139d03d38 100644
+--- a/security/ipe/hooks.c
++++ b/security/ipe/hooks.c
+@@ -312,7 +312,8 @@ int ipe_bdev_setintegrity(struct block_device *bdev, enum lsm_integrity_type typ
+ }
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ /**
+  * ipe_inode_setintegrity() - save integrity data from a inode to IPE's LSM blob.
+  * @inode: The inode to source the security blob from.
+@@ -320,8 +321,8 @@ int ipe_bdev_setintegrity(struct block_device *bdev, enum lsm_integrity_type typ
+  * @value: The value to be stored.
+  * @size: The size of @value.
+  *
+- * This hook is currently used to save the existence of a validated fs-verity
+- * builtin signature into LSM blob.
++ * This hook is used to save the existence of a validated fs-verity builtin
++ * signature and/or overlay verity validation status into the LSM blob.
+  *
+  * Return: %0 on success. If an error occurs, the function will return the
+  * -errno.
+@@ -332,11 +333,25 @@ int ipe_inode_setintegrity(const struct inode *inode,
+ {
+ 	struct ipe_inode *inode_sec = ipe_inode(inode);
+ 
++#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
+ 	if (type == LSM_INT_FSVERITY_BUILTINSIG_VALID) {
+ 		inode_sec->fs_verity_signed = size > 0 && value;
+ 		return 0;
+ 	}
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++
++#ifdef CONFIG_IPE_PROP_OVL_VERITY
++	if (type == LSM_INT_OVL_VERITY_VALIDATED) {
++		/*
++		 * Set or clear the validated flag. Passing value=NULL or
++		 * size=0 clears it, supporting future overlay invalidation.
++		 */
++		WRITE_ONCE(inode_sec->ovl_verity_validated,
++			   size > 0 && value);
++		return 0;
++	}
++#endif /* CONFIG_IPE_PROP_OVL_VERITY */
+ 
+ 	return -EINVAL;
+ }
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+diff --git a/security/ipe/hooks.h b/security/ipe/hooks.h
+index 07db37332..2d39cf95b 100644
+--- a/security/ipe/hooks.h
++++ b/security/ipe/hooks.h
+@@ -47,9 +47,10 @@ int ipe_bdev_setintegrity(struct block_device *bdev, enum lsm_integrity_type typ
+ 			  const void *value, size_t len);
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ int ipe_inode_setintegrity(const struct inode *inode, enum lsm_integrity_type type,
+ 			   const void *value, size_t size);
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+ 
+ #endif /* _IPE_HOOKS_H */
+diff --git a/security/ipe/ipe.c b/security/ipe/ipe.c
+index 495bb765d..ef3551cf7 100644
+--- a/security/ipe/ipe.c
++++ b/security/ipe/ipe.c
+@@ -16,9 +16,10 @@ static struct lsm_blob_sizes ipe_blobs __ro_after_init = {
+ #ifdef CONFIG_IPE_PROP_DM_VERITY
+ 	.lbs_bdev = sizeof(struct ipe_bdev),
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ 	.lbs_inode = sizeof(struct ipe_inode),
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+ };
+ 
+ static const struct lsm_id ipe_lsmid = {
+@@ -38,12 +39,13 @@ struct ipe_bdev *ipe_bdev(struct block_device *b)
+ }
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+ 
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ struct ipe_inode *ipe_inode(const struct inode *inode)
+ {
+ 	return inode->i_security + ipe_blobs.lbs_inode;
+ }
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+ 
+ static struct security_hook_list ipe_hooks[] __ro_after_init = {
+ 	LSM_HOOK_INIT(bprm_check_security, ipe_bprm_check_security),
+@@ -57,9 +59,10 @@ static struct security_hook_list ipe_hooks[] __ro_after_init = {
+ 	LSM_HOOK_INIT(bdev_free_security, ipe_bdev_free_security),
+ 	LSM_HOOK_INIT(bdev_setintegrity, ipe_bdev_setintegrity),
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ 	LSM_HOOK_INIT(inode_setintegrity, ipe_inode_setintegrity),
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+ };
+ 
+ /**
+diff --git a/security/ipe/ipe.h b/security/ipe/ipe.h
+index 25cfdb8f0..ceef524a8 100644
+--- a/security/ipe/ipe.h
++++ b/security/ipe/ipe.h
+@@ -19,9 +19,10 @@ extern bool ipe_enabled;
+ #ifdef CONFIG_IPE_PROP_DM_VERITY
+ struct ipe_bdev *ipe_bdev(struct block_device *b);
+ #endif /* CONFIG_IPE_PROP_DM_VERITY */
+-#ifdef CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG
++#if defined(CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG) || \
++    defined(CONFIG_IPE_PROP_OVL_VERITY)
+ struct ipe_inode *ipe_inode(const struct inode *inode);
+-#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG */
++#endif /* CONFIG_IPE_PROP_FS_VERITY_BUILTIN_SIG || CONFIG_IPE_PROP_OVL_VERITY */
+ 
+ int ipe_init_securityfs(void);
+ 
+diff --git a/security/ipe/policy.h b/security/ipe/policy.h
+index 5bfbdbdde..f3a65a41a 100644
+--- a/security/ipe/policy.h
++++ b/security/ipe/policy.h
+@@ -39,6 +39,8 @@ enum ipe_prop_type {
+ 	IPE_PROP_FSV_DIGEST,
+ 	IPE_PROP_FSV_SIG_FALSE,
+ 	IPE_PROP_FSV_SIG_TRUE,
++	IPE_PROP_OVL_VERITY_FALSE,
++	IPE_PROP_OVL_VERITY_TRUE,
+ 	__IPE_PROP_MAX
+ };
+ 
+diff --git a/security/ipe/policy_parser.c b/security/ipe/policy_parser.c
+index 6fa5bebf8..bdaaa9786 100644
+--- a/security/ipe/policy_parser.c
++++ b/security/ipe/policy_parser.c
+@@ -281,6 +281,8 @@ static const match_table_t property_tokens = {
+ 	{IPE_PROP_FSV_DIGEST,		"fsverity_digest=%s"},
+ 	{IPE_PROP_FSV_SIG_FALSE,	"fsverity_signature=FALSE"},
+ 	{IPE_PROP_FSV_SIG_TRUE,		"fsverity_signature=TRUE"},
++	{IPE_PROP_OVL_VERITY_FALSE,	"overlay_verity_validated=FALSE"},
++	{IPE_PROP_OVL_VERITY_TRUE,	"overlay_verity_validated=TRUE"},
+ 	{IPE_PROP_INVALID,		NULL}
+ };
+ 
+@@ -331,6 +333,8 @@ static int parse_property(char *t, struct ipe_rule *r)
+ 	case IPE_PROP_DMV_SIG_TRUE:
+ 	case IPE_PROP_FSV_SIG_FALSE:
+ 	case IPE_PROP_FSV_SIG_TRUE:
++	case IPE_PROP_OVL_VERITY_FALSE:
++	case IPE_PROP_OVL_VERITY_TRUE:
+ 		p->type = token;
+ 		break;
+ 	default:
+diff --git a/security/ipe/policy_tests.c b/security/ipe/policy_tests.c
+index 5f1654dee..f8c36559b 100644
+--- a/security/ipe/policy_tests.c
++++ b/security/ipe/policy_tests.c
+@@ -227,7 +227,28 @@ static const struct policy_case policy_cases[] = {
+ 		"op=EXECUTE fsverity_digest=1c0d7ee1f8343b7fbe418378e8eb22c061d7dec7 action=DENY\n",
+ 		-EBADMSG,
+ 		"old-style digest"
+-	}
++	},
++	{
++		"policy_name=composefs_allow policy_version=0.0.0\n"
++		"DEFAULT action=DENY\n"
++		"op=EXECUTE overlay_verity_validated=TRUE action=ALLOW\n",
++		0,
++		"overlay verity validated TRUE",
++	},
++	{
++		"policy_name=composefs_deny policy_version=0.0.0\n"
++		"DEFAULT action=ALLOW\n"
++		"op=EXECUTE overlay_verity_validated=FALSE action=DENY\n",
++		0,
++		"overlay verity validated FALSE",
++	},
++	{
++		"policy_name=composefs_invalid policy_version=0.0.0\n"
++		"DEFAULT action=ALLOW\n"
++		"op=EXECUTE overlay_verity_validated=MAYBE action=ALLOW\n",
++		-EBADMSG,
++		"overlay verity validated invalid value",
++	},
+ };
+ 
+ static void pol_to_desc(const struct policy_case *c, char *desc)
+-- 
+2.53.0
+

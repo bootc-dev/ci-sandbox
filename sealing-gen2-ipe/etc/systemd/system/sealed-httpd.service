@@ -1,0 +1,18 @@
+[Unit]
+Description=Sealed httpd application (composefs-verified)
+After=composefs-load-appkeys.service network-online.target
+Wants=network-online.target
+Requires=composefs-load-appkeys.service
+ConditionPathExists=/usr/lib/composefs/app-signing-cert.pem
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/sealed-httpd
+ExecStart=/usr/lib/composefs/run-sealed-app.sh
+ExecStop=/usr/lib/composefs/stop-sealed-app.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

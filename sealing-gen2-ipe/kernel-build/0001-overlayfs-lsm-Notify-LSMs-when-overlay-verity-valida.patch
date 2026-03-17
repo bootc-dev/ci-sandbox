@@ -1,0 +1,73 @@
+From 4cdf97392077058083e6b7301e974077e2cc8a36 Mon Sep 17 00:00:00 2001
+From: Colin Walters <walters@verbum.org>
+Date: Mon, 16 Mar 2026 01:44:26 +0000
+Subject: [PATCH 1/2] overlayfs,lsm: Notify LSMs when overlay verity validation
+ succeeds
+
+Add LSM_INT_OVL_VERITY_VALIDATED to enum lsm_integrity_type. When
+overlayfs validates that a metacopy file's data content matches the
+fs-verity digest recorded in the metadata layer (via ovl_validate_verity()),
+call security_inode_setintegrity() on the overlay inode to inform LSMs.
+
+This enables LSMs like IPE to make policy decisions based on whether
+overlay files have been verity-validated against their metadata layer,
+which is the foundation for composefs-style integrity: a signed EROFS
+metadata image encodes per-file fs-verity digests, overlayfs enforces
+them with verity=require, and now LSMs can observe that verification.
+
+The return value is checked and warnings are emitted on failure, matching
+the error handling pattern used by the fs-verity signature caller.
+
+Assisted-by: OpenCode (Claude Opus 4)
+---
+ fs/overlayfs/namei.c     | 13 ++++++++++++-
+ include/linux/security.h |  1 +
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/fs/overlayfs/namei.c b/fs/overlayfs/namei.c
+index d8dd4b052..8dfce219b 100644
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@ -13,6 +13,7 @@
+ #include <linux/ratelimit.h>
+ #include <linux/mount.h>
+ #include <linux/exportfs.h>
++#include <linux/security.h>
+ #include "overlayfs.h"
+ 
+ struct ovl_lookup_data {
+@@ -987,8 +988,18 @@ static int ovl_maybe_validate_verity(struct dentry *dentry)
+ 	if (!ovl_test_flag(OVL_VERIFIED_DIGEST, inode)) {
+ 		with_ovl_creds(dentry->d_sb)
+ 			err = ovl_validate_verity(ofs, &metapath, &datapath);
+-		if (err == 0)
++		if (err == 0) {
++			static const bool validated = true;
++			int ret;
++
+ 			ovl_set_flag(OVL_VERIFIED_DIGEST, inode);
++			ret = security_inode_setintegrity(inode,
++				LSM_INT_OVL_VERITY_VALIDATED,
++				&validated, sizeof(validated));
++			if (ret)
++				pr_warn_ratelimited("overlay: failed to notify LSM of verity validation: %d\n",
++						    ret);
++		}
+ 	}
+ 
+ 	ovl_inode_unlock(inode);
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 83a646d72..c22e84397 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -98,6 +98,7 @@ enum lsm_integrity_type {
+ 	LSM_INT_DMVERITY_SIG_VALID,
+ 	LSM_INT_DMVERITY_ROOTHASH,
+ 	LSM_INT_FSVERITY_BUILTINSIG_VALID,
++	LSM_INT_OVL_VERITY_VALIDATED,
+ };
+ 
+ /*
+-- 
+2.53.0
+

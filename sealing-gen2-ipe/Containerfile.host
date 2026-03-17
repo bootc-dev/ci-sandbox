@@ -1,0 +1,139 @@
+# Containerfile.host — Sealed bootc host with composefs root + app signing
+#
+# Pattern follows composefs-rs examples/unified-secureboot:
+# 1. Base stage: install all packages
+# 2. Kernel stage: bind-mount base, compute composefs digest, build signed UKI
+# 3. Final stage: COPY /boot from kernel stage
+#
+# The final image has the same rootfs content as `base` plus /boot from
+# the kernel stage. bootc install puts /boot on the ESP (separate from
+# the composefs-verified rootfs), so the digest computed against `base`
+# matches what bootc install computes from the container.
+#
+# Build:
+#   podman build -f Containerfile.host \
+#     --secret id=secureboot_key,src=sb-db.key \
+#     --secret id=secureboot_cert,src=sb-db.crt \
+#     -t localhost/sealed-host:latest .
+
+ARG CFSCTL_IMAGE=ghcr.io/cgwalters/ci-sandbox/cfsctl:composefs
+
+# --- Stage: fetch cfsctl ---
+FROM quay.io/centos/centos:stream10 AS fetch-cfsctl
+ARG CFSCTL_IMAGE
+RUN dnf -y install tar gzip && dnf clean all
+RUN curl -sLO "https://github.com/oras-project/oras/releases/download/v1.3.1/oras_1.3.1_linux_amd64.tar.gz" && \
+    tar xzf oras_1.3.1_linux_amd64.tar.gz oras && rm oras_1.3.1_linux_amd64.tar.gz
+RUN ./oras pull "${CFSCTL_IMAGE}" && chmod +x cfsctl
+
+# --- Stage: rootfs-builder (install packages on the bootc base) ---
+FROM quay.io/centos-bootc/centos-bootc:stream10 AS rootfs-builder
+
+ARG SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
+
+# sbsigntools from EPEL; systemd-boot-unsigned for bootctl install
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    dnf -y install epel-release && \
+    dnf -y install crun systemd-boot-unsigned systemd-ukify sbsigntools && \
+    dnf clean all
+
+COPY --from=fetch-cfsctl /cfsctl /usr/bin/cfsctl
+
+# App-signing certificate + services
+COPY app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
+COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
+COPY usr/lib/composefs/load-app-keys.sh /usr/lib/composefs/
+COPY etc/default/sealed-httpd /etc/default/sealed-httpd
+COPY etc/systemd/system/sealed-httpd.service /etc/systemd/system/
+COPY usr/lib/composefs/run-sealed-app.sh /usr/lib/composefs/
+COPY usr/lib/composefs/stop-sealed-app.sh /usr/lib/composefs/
+
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    sed -i "s|^SEALED_APP_IMAGE=.*|SEALED_APP_IMAGE=${SEALED_APP_IMAGE}|" \
+    /etc/default/sealed-httpd && \
+    chmod +x /usr/lib/composefs/load-app-keys.sh \
+             /usr/lib/composefs/run-sealed-app.sh \
+             /usr/lib/composefs/stop-sealed-app.sh && \
+    systemctl enable composefs-load-appkeys.service && \
+    systemctl enable sealed-httpd.service
+
+# composefs backend uses systemd-boot, not grub/bootupd
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    rpm -e bootupd 2>/dev/null || true
+
+# Default to ext4 (supports fsverity, required for composefs)
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    mkdir -p /usr/lib/bootc/install && \
+    cat > /usr/lib/bootc/install/00-composefs.toml <<'EOF'
+[install.filesystem.root]
+type = "ext4"
+EOF
+
+# Include the bootc dracut module in the initramfs so that composefs
+# root setup happens during boot (the module's check() returns 255,
+# meaning it's never auto-included). Then rebuild the initramfs.
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    mkdir -p /etc/dracut.conf.d && \
+    echo 'add_dracutmodules+=" bootc "' > /etc/dracut.conf.d/50-bootc-composefs.conf && \
+    kver=$(ls /usr/lib/modules/) && \
+    dracut --force --kver "$kver" /usr/lib/modules/$kver/initramfs.img && \
+    echo "Rebuilt initramfs with bootc module" && \
+    lsinitrd /usr/lib/modules/$kver/initramfs.img | grep -c bootc
+
+# Sign systemd-boot with our Secure Boot key so UEFI firmware will load it.
+# This must happen BEFORE the flatten so the signed binary is in the digest.
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=secret,id=secureboot_key \
+    --mount=type=secret,id=secureboot_cert \
+    sbsign --key /run/secrets/secureboot_key \
+           --cert /run/secrets/secureboot_cert \
+           --output /tmp/systemd-bootx64.efi.signed \
+           /usr/lib/systemd/boot/efi/systemd-bootx64.efi && \
+    mv /tmp/systemd-bootx64.efi.signed /usr/lib/systemd/boot/efi/systemd-bootx64.efi
+
+# --- Stage: base (flatten to single layer for deterministic digests) ---
+# This is the workaround for composefs-rs#132: podman's overlayfs
+# layer stitching produces nondeterministic directory timestamps.
+# Flattening via FROM scratch + COPY eliminates all layer boundaries.
+FROM scratch AS base
+COPY --from=rootfs-builder / /
+LABEL containers.bootc 1
+LABEL ostree.bootable 1
+ENV container=oci
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+
+# --- Stage: kernel (compute digest + build signed UKI) ---
+FROM base AS kernel
+# Compute composefs digest and build signed UKI
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=base,target=/target \
+    --mount=type=secret,id=secureboot_key \
+    --mount=type=secret,id=secureboot_cert <<EORUN
+set -xeuo pipefail
+mkdir -p /out
+# SELinux must be permissive for sealed UKI boot (bootc#1826).
+# console=ttyS0 enables serial console for debugging.
+bootc container ukify --rootfs /target \
+  --karg rw \
+  --karg enforcing=0 \
+  --karg console=tty0 \
+  --karg console=ttyS0,115200n8 \
+  --karg console=hvc0,115200 \
+  --karg systemd.journald.forward_to_console=1 \
+  -- \
+  --signtool sbsign \
+  --secureboot-private-key /run/secrets/secureboot_key \
+  --secureboot-certificate /run/secrets/secureboot_cert \
+  --output /out/uki.efi
+ls -lh /out/
+EORUN
+# Move the UKI into /boot with the right name
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    kver=$(bootc container inspect --json | jq -r '.kernel.version') && \
+    mkdir -p /boot/EFI/Linux && \
+    mv /out/uki.efi "/boot/EFI/Linux/${kver}.efi"
+
+# --- Final image: base rootfs + /boot from kernel stage ---
+FROM base
+COPY --from=kernel /boot /boot
