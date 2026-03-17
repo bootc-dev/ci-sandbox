@@ -1,0 +1,70 @@
+name: Build sealed composefs host
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sealing/**'
+  pull_request:
+    paths:
+      - 'sealing/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOST_IMAGE: ghcr.io/${{ github.repository }}/sealed-host
+
+defaults:
+  run:
+    working-directory: sealing
+
+jobs:
+  build:
+    name: Build sealed host
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      # For PR builds, generate ephemeral Secure Boot keys.
+      # Main branch uses secrets.
+      - name: Write signing keys
+        env:
+          SECUREBOOT_DB_KEY: ${{ secrets.SECUREBOOT_DB_KEY }}
+          SECUREBOOT_DB_CERT: ${{ secrets.SECUREBOOT_DB_CERT }}
+        run: |
+          mkdir -p /tmp/keys
+          if [ -n "${SECUREBOOT_DB_KEY}" ]; then
+            printenv SECUREBOOT_DB_KEY > /tmp/keys/sb-db.key
+            printenv SECUREBOOT_DB_CERT > /tmp/keys/sb-db.crt
+          else
+            openssl req -x509 -newkey rsa:2048 -nodes \
+              -keyout /tmp/keys/sb-db.key -out /tmp/keys/sb-db.crt \
+              -days 1 -subj '/CN=composefs-ci-ephemeral-db/'
+          fi
+
+      - name: Build sealed host image
+        run: |
+          podman build -f Containerfile.host \
+            --secret id=secureboot_key,src=/tmp/keys/sb-db.key \
+            --secret id=secureboot_cert,src=/tmp/keys/sb-db.crt \
+            -t localhost/sealed-host:latest .
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push host image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: podman push localhost/sealed-host:latest docker://${HOST_IMAGE}:latest
+
+      - name: Clean up keys
+        if: always()
+        run: rm -rf /tmp/keys
