@@ -15,6 +15,7 @@ Containerfile can embed it without build secrets.
 import argparse
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 DEFAULT_KEYS_DIR = "target/keys"
@@ -60,6 +61,12 @@ def generate_keys(output_dir: Path):
             "-subj",
             f"/CN={cn}",
         )
+
+    # GUID (required by bcvk for firmware enrollment)
+    guid_file = output_dir / "GUID.txt"
+    if not guid_file.exists():
+        guid_file.write_text(str(uuid.uuid4()) + "\n")
+        print(f"  create GUID.txt")
 
     # Create bcvk-compatible symlinks (bcvk expects PK.crt, not sb-PK.crt)
     for name in ("PK", "KEK", "db"):
