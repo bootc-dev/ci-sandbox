@@ -5,10 +5,12 @@
 # digest; Secure Boot verifies the UKI, which in turn verifies every
 # file on the root filesystem via fs-verity.
 #
+# The db certificate (public) is read from the build context.
+# Only the db private key is a build secret.
+#
 # Build:
 #   podman build -f Containerfile.host \
 #     --secret id=secureboot_key,src=target/keys/sb-db.key \
-#     --secret id=secureboot_cert,src=target/keys/sb-db.crt \
 #     -t localhost/sealed-host:latest .
 
 # --- Stage: rootfs-builder (install packages on the bootc base) ---
@@ -47,9 +49,9 @@ RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
 # This must happen BEFORE the flatten so the signed binary is in the digest.
 RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
     --mount=type=secret,id=secureboot_key \
-    --mount=type=secret,id=secureboot_cert \
+    --mount=type=bind,source=keys/db.crt,target=/tmp/db.crt \
     sbsign --key /run/secrets/secureboot_key \
-           --cert /run/secrets/secureboot_cert \
+           --cert /tmp/db.crt \
            --output /tmp/systemd-bootx64.efi.signed \
            /usr/lib/systemd/boot/efi/systemd-bootx64.efi && \
     mv /tmp/systemd-bootx64.efi.signed /usr/lib/systemd/boot/efi/systemd-bootx64.efi
@@ -68,7 +70,7 @@ FROM base AS kernel
 RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
     --mount=type=bind,from=base,target=/target \
     --mount=type=secret,id=secureboot_key \
-    --mount=type=secret,id=secureboot_cert <<EORUN
+    --mount=type=bind,source=keys/db.crt,target=/tmp/db.crt <<EORUN
 set -xeuo pipefail
 mkdir -p /out
 bootc container ukify --rootfs /target \
@@ -81,7 +83,7 @@ bootc container ukify --rootfs /target \
   -- \
   --signtool sbsign \
   --secureboot-private-key /run/secrets/secureboot_key \
-  --secureboot-certificate /run/secrets/secureboot_cert \
+  --secureboot-certificate /tmp/db.crt \
   --output /out/uki.efi
 ls -lh /out/
 EORUN

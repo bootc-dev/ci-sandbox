@@ -17,9 +17,11 @@ composefs digest of the root filesystem. At boot:
 just keygen
 ```
 
-This creates `target/keys/` with PK, KEK, and db keypairs.
+This generates PK, KEK, and db keypairs in `target/keys/` and copies
+`db.crt` into `keys/` for committing. PK and KEK are only used for
+firmware enrollment (bcvk handles this); db signs the boot artifacts.
 
-You also need `virt-firmware` for Secure Boot key enrollment into OVMF:
+You also need `virt-firmware` for OVMF key enrollment:
 
 ```sh
 pip install virt-firmware
@@ -36,8 +38,6 @@ composefs backend. After boot (~3 min first time), it verifies that
 the root is a composefs overlay with `verity=require`.
 
 ### 3. Manual exploration
-
-Build the image separately if you want to poke around:
 
 ```sh
 just build-host
@@ -70,17 +70,17 @@ bcvk libvirt rm --stop --force sealed-demo
 Build time
 ├── Containerfile.host
 │     ├── Install packages (systemd-boot, sbsigntools, systemd-ukify)
-│     ├── Sign systemd-boot with Secure Boot db key
+│     ├── Sign systemd-boot with db key (secret: db.key, public: keys/db.crt)
 │     ├── Rebuild initramfs with bootc dracut module
 │     └── FROM scratch flatten (deterministic composefs digest)
 ├── bootc container ukify
 │     ├── Compute composefs SHA-512 digest from flattened rootfs
 │     ├── Embed digest + kargs in UKI command line
-│     └── Sign UKI with Secure Boot db key (sbsign)
+│     └── Sign UKI with db key
 └── COPY --from=kernel /boot /boot
 
 Boot time (UEFI → systemd-boot → UKI → composefs)
-├── UEFI verifies systemd-boot signature against enrolled db
+├── UEFI verifies systemd-boot signature against enrolled db cert
 ├── systemd-boot loads UKI
 ├── Kernel starts with composefs=<digest> in cmdline
 ├── initramfs: bootc-root-setup.service
@@ -90,6 +90,25 @@ Boot time (UEFI → systemd-boot → UKI → composefs)
 │     └── Bind-mounts /etc and /var from state
 └── switch-root into composefs overlay
 ```
+
+## Key management
+
+Only one secret: the Secure Boot db private key (`db.key`). Everything
+else is public or derived:
+
+| File | Secret? | Where | Purpose |
+|---|---|---|---|
+| `keys/db.crt` | No | Committed to repo | Public cert; used by `sbsign` and enrolled in firmware |
+| `db.key` | **Yes** | CI secret / local `target/keys/` | Signs systemd-boot and UKI |
+| `PK.key`, `KEK.key` | Local only | `target/keys/` | Firmware enrollment (bcvk, virt-fw-vars, or cloud API) |
+
+For CI, set one GitHub Actions secret:
+
+| Secret | Description |
+|---|---|
+| `SECUREBOOT_DB_KEY` | Secure Boot db private key (PEM) |
+
+PR builds use ephemeral keys so no secrets are needed for CI validation.
 
 ## Key learnings
 
@@ -104,23 +123,13 @@ Boot time (UEFI → systemd-boot → UKI → composefs)
   `dracut.conf.d` and the initramfs rebuilt — its `check()` returns
   255 so it's never auto-included.
 
-- systemd-boot must be signed with the Secure Boot db key before the
-  `FROM scratch` flatten so the signed binary is in the composefs digest.
+- systemd-boot must be signed with the db key before the `FROM scratch`
+  flatten so the signed binary is in the composefs digest.
 
 - SELinux must be permissive (`enforcing=0`) for composefs boot
   ([bootc#1826](https://github.com/bootc-dev/bootc/issues/1826)).
 
 - First boot takes ~3 minutes because sshd-keygen runs late.
-
-## CI secrets
-
-The GitHub Actions workflow needs these secrets for main-branch pushes
-(PR builds use ephemeral keys):
-
-| Secret | Source file | Description |
-|---|---|---|
-| `SECUREBOOT_DB_KEY` | `sb-db.key` | Secure Boot db private key |
-| `SECUREBOOT_DB_CERT` | `sb-db.crt` | Secure Boot db certificate |
 
 ## Current limitations
 

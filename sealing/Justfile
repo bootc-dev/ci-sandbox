@@ -4,27 +4,35 @@
 # backend (UKI + composefs digest + Secure Boot).
 #
 # Prerequisites: podman, openssl, just
-# For VM testing: bcvk (from bootc-dev/bcvk)
+# For VM testing: bcvk (from bootc-dev/bcvk), virt-firmware (pip)
 
 # Local image name
 host_image := "localhost/sealed-host:latest"
 
-# Key material directory
+# Key material directory (for local dev; CI uses secrets)
 keys_dir := justfile_directory() + "/target/keys"
 
-# Generate Secure Boot keypairs
+# Generate Secure Boot keys (PK/KEK for enrollment, db for signing).
+# Copies db.crt into keys/ for committing to the repo.
 keygen:
     #!/bin/bash
     set -euo pipefail
     python3 util/keys.py generate --output-dir "{{keys_dir}}"
+    mkdir -p keys/
+    cp "{{keys_dir}}/sb-db.crt" keys/db.crt
+    echo "keys/db.crt updated — commit it to the repo"
 
-# Build the sealed host image (composefs backend with signed UKI)
-build-host: keygen
+# Build the sealed host image (composefs backend with signed UKI).
+# Only the db private key is a secret; db.crt is in the build context.
+build-host:
     #!/bin/bash
     set -euo pipefail
+    if [ ! -f "{{keys_dir}}/sb-db.key" ]; then
+        echo "No keys found. Run 'just keygen' first."
+        exit 1
+    fi
     podman build -f Containerfile.host \
         --secret id=secureboot_key,src="{{keys_dir}}/sb-db.key" \
-        --secret id=secureboot_cert,src="{{keys_dir}}/sb-db.crt" \
         -t "{{host_image}}" .
     echo "Host image built: {{host_image}}"
 
