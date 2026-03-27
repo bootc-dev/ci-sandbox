@@ -27,8 +27,8 @@ bootc-kernel-cmdline = { path = "../kernel_cmdline", version = "0.0.0" }
 
 # Crate-specific dependencies
 libtest-mimic = "0.8.0"
-oci-spec = "0.8.0"
-rexpect = "0.6"
+oci-spec = "0.9.0"
+rexpect = "0.7"
 
 [lints]
 workspace = true
