@@ -2,25 +2,25 @@
   {
     "_renovate": "datasource=docker depName=quay.io/fedora/fedora-bootc",
     "name": "fedora-bootc",
-    "tag": "43",
-    "source": "quay.io/fedora/fedora-bootc:43@sha256:dca83fb0b030b529394a129e82f0f75913d0b21f9da304b7ac048b1f12e48932"
+    "tag": "45",
+    "source": "quay.io/fedora/fedora-bootc:45@sha256:c03d2f5e8bc543c1371df582f40bc54b841a4bfa09749bac6b0137e37f74d665"
   },
   {
     "_renovate": "datasource=docker depName=quay.io/fedora/fedora-bootc",
     "name": "fedora-bootc",
-    "tag": "44",
-    "source": "quay.io/fedora/fedora-bootc:44@sha256:4abd97abb04f600ba7a0eda950fd1d241d43bf472fd9fdd85e87a6be6cd5b1d1"
+    "tag": "45",
+    "source": "quay.io/fedora/fedora-bootc:45@sha256:c03d2f5e8bc543c1371df582f40bc54b841a4bfa09749bac6b0137e37f74d665"
   },
   {
     "_renovate": "datasource=docker depName=quay.io/centos-bootc/centos-bootc",
     "name": "centos-bootc",
     "tag": "stream9",
-    "source": "quay.io/centos-bootc/centos-bootc:stream9@sha256:2b96ee6f7157ed79c0f3db4d2c56686444e61733cabddc6229711c6a6b5dd673"
+    "source": "quay.io/centos-bootc/centos-bootc:stream9@sha256:c68a98f2026227bee0cf46b69ceeab0021aea9bc116d75e30076b31aa4fe1e5d"
   },
   {
     "_renovate": "datasource=docker depName=quay.io/centos-bootc/centos-bootc",
     "name": "centos-bootc",
     "tag": "stream10",
-    "source": "quay.io/centos-bootc/centos-bootc:stream10@sha256:43d2199dc2b147905ff3970b77957ac4775554b5ee6973abb577243a3fa28614"
+    "source": "quay.io/centos-bootc/centos-bootc:stream10@sha256:046bb6a48b44f5c0b4781a2c3f641ff9ce93800a2abe4d2b013e99d99659466b"
   }
 ]
