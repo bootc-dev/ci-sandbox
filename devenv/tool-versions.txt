@@ -9,4 +9,4 @@ scorecard@v5.4.0
 # renovate: datasource=github-releases depName=nushell/nushell
 nushell@0.111.0
 # renovate: datasource=github-releases depName=jj-vcs/jj
-jj@0.39.0
+jj@0.40.0

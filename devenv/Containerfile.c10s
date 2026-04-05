@@ -27,14 +27,14 @@ EORUN
 
 FROM base as tools
 # renovate: datasource=github-releases depName=astral-sh/uv
-ARG uvversion=0.11.2
+ARG uvversion=0.11.3
 COPY fetch-tools.py tool-versions.txt install-uv.sh /run/src/
 RUN /run/src/fetch-tools.py
 RUN uvversion=$uvversion /run/src/install-uv.sh
 
 FROM base as rust
 # renovate: datasource=custom.rust-nightly depName=rust-nightly versioning=rust-release-channel
-ARG rust_nightly=nightly-2026-03-29
+ARG rust_nightly=nightly-2026-04-05
 COPY install-rust.sh /run/src/
 RUN rust_nightly=$rust_nightly /run/src/install-rust.sh
 
