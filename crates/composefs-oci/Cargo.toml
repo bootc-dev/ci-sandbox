@@ -43,7 +43,7 @@ tracing = { version = "0.1", default-features = false }
 [dev-dependencies]
 cap-std = { version = "4.0.0", default-features = false }
 cap-tempfile = { version = "4.0.0", default-features = false }
-similar-asserts = "1.7.0"
+similar-asserts = "2.0.0"
 tar = { version = "0.4.38", default-features = false }
 rand = { version = "0.10.0", default-features = false }
 composefs = { workspace = true, features = ["test"] }
