@@ -100,8 +100,8 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, accessat, flock, linkat,
-        mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
+        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, StatVfsMountFlags,
+        accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -1887,6 +1887,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Like [`ensure_writable`] but returns a proof token for internal use.
     pub(crate) fn ensure_writable_token(&self) -> Result<WritableRepo> {
+        // fstatvfs catches read-only mounts (ST_RDONLY).  faccessat(W_OK)
+        // alone is insufficient because it only checks DAC permission bits
+        // and root bypasses those, so a root process on a read-only
+        // bind-mounted repo would pass the faccessat check.  Conversely,
+        // fstatvfs alone misses writable filesystems where the caller lacks
+        // write permission (e.g. a repo owned by another user), so we follow
+        // up with faccessat to catch that case.
+        let st = fstatvfs(&self.repository).context("Repository is not writable")?;
+        if st.f_flag.contains(StatVfsMountFlags::RDONLY) {
+            anyhow::bail!("Repository is not writable: read-only file system");
+        }
         accessat(&self.repository, ".", Access::WRITE_OK, AtFlags::empty())
             .context("Repository is not writable")?;
         Ok(WritableRepo)
