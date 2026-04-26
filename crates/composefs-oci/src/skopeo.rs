@@ -129,11 +129,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             }
 
             None => {
-                ImageProxyConfig {
-                    skopeo_cmd,
-                    // auth_anonymous: true, debug: true, insecure_skip_tls_verification: None,
-                    ..ImageProxyConfig::default()
-                }
+                let mut conf = ImageProxyConfig::default();
+                conf.skopeo_cmd = skopeo_cmd;
+                conf
             }
         };
 

@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
 use containers_image_proxy::oci_spec::image::{Descriptor, Digest as OciDigest, MediaType};
 use fn_error_context::context;
-use ocidir::OciDir;
+use ocidir::{OciDir, ResolvedManifest};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::debug;
@@ -61,6 +61,13 @@ pub(crate) fn parse_oci_layout_ref(imgref: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Resolve a manifest from an OCI layout directory for the current platform.
+fn resolve_manifest(ocidir: &OciDir, tag: Option<&str>) -> Result<ResolvedManifest> {
+    ocidir
+        .open_image_this_platform(tag)
+        .context("Resolving manifest for platform")
+}
+
 /// Import an image from a local OCI layout directory.
 ///
 /// This is the fast path for `oci:` transport references. It reads the OCI
@@ -76,10 +83,8 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
     let ocidir = OciDir::open(dir).context("Opening OCI directory")?;
 
-    // Resolve the manifest for this platform, peeling through manifest lists if needed
-    let resolved = ocidir
-        .open_image_this_platform(layout_tag)
-        .context("Resolving manifest for platform")?;
+    // Resolve the manifest, with fallback for images lacking platform annotations
+    let resolved = resolve_manifest(&ocidir, layout_tag)?;
 
     let manifest = resolved.manifest;
     let manifest_descriptor = &resolved.manifest_descriptor;
@@ -416,8 +421,7 @@ mod tests {
         let err = result.expect_err("should fail with no matching platform");
         let err_msg = format!("{err:#}");
         assert!(
-            err_msg.contains("No manifest found for platform")
-                || err_msg.contains("no platform info"),
+            err_msg.contains("No manifest found for platform"),
             "unexpected error: {err_msg}"
         );
     }
