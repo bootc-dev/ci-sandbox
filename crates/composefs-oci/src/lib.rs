@@ -651,9 +651,12 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
     // Parse the config to get the canonical ordering of diff_ids.
     let config = ImageConfiguration::from_reader(config_json)?;
     for diff_id_str in config.rootfs().diff_ids() {
-        let value = refs
-            .get(diff_id_str.as_str())
-            .with_context(|| format!("missing layer verity for diff_id {diff_id_str}"))?;
+        let value = refs.get(diff_id_str.as_str()).with_context(|| {
+            let keys: Vec<_> = refs.keys().collect();
+            format!(
+                "missing layer verity for diff_id {diff_id_str}. Available keys in refs: {keys:?}"
+            )
+        })?;
         stream.add_named_stream_ref(diff_id_str, value);
     }
     if let Some(image_id) = image {

@@ -242,11 +242,11 @@ fn unescape_to_path_canonical(s: &str) -> Result<Cow<'_, Path>> {
             continue;
         }
         match component {
-            b"" => {
+            b""
                 // Only valid for root path (i.e. single trailing empty after "/")
-                if !(i == 1 && path_bytes == b"/") {
-                    anyhow::bail!("Empty path component (// or trailing /)");
-                }
+                if !(i == 1 && path_bytes == b"/") =>
+            {
+                anyhow::bail!("Empty path component (// or trailing /)");
             }
             b"." => anyhow::bail!("Invalid path component '.'"),
             b".." => anyhow::bail!("Invalid path component '..'"),
