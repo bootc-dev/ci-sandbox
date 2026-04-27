@@ -1,10 +1,15 @@
 name: CI
 
+permissions:
+  actions: read
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
   workflow_dispatch: {}
 
@@ -13,14 +18,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Determine the OS matrix for CI jobs based on context:
+  #   - merge_group / workflow_dispatch / ci/merge label: all OSes
+  #   - ci/tier-1 label: centos-10 only (fast feedback on the primary target)
+  #   - plain PR: no heavy jobs
   compute-ci-level:
     runs-on: ubuntu-latest
     outputs:
-      full: ${{ steps.check.outputs.full }}
+      package_os_matrix: ${{ steps.matrix.outputs.package_os_matrix }}
+      integration_os_matrix: ${{ steps.matrix.outputs.integration_os_matrix }}
+      upgrade_os_matrix: ${{ steps.matrix.outputs.upgrade_os_matrix }}
+      run_heavy: ${{ steps.matrix.outputs.run_heavy }}
     steps:
-      - name: Check if full CI is requested
-        id: check
-        run: echo "full=${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci-full') }}" >> "$GITHUB_OUTPUT"
+      - name: Compute OS matrices
+        id: matrix
+        run: |
+          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          EVENT='${{ github.event_name }}'
+
+          if [[ "$EVENT" == "merge_group" || "$EVENT" == "workflow_dispatch" ]] \
+              || echo "$LABELS" | jq -e 'index("ci/merge")' > /dev/null; then
+            # Full suite: all OSes
+            echo 'package_os_matrix=["fedora-43","fedora-44","fedora-45","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'integration_os_matrix=["fedora-43","fedora-44","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'upgrade_os_matrix=["fedora-43","centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | jq -e 'index("ci/tier-1")' > /dev/null; then
+            # Tier-1 only: centos-10
+            echo 'package_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'integration_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'upgrade_os_matrix=["centos-10"]' >> "$GITHUB_OUTPUT"
+            echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
+          else
+            # Plain PR: skip heavy jobs entirely
+            echo 'package_os_matrix=[]' >> "$GITHUB_OUTPUT"
+            echo 'integration_os_matrix=[]' >> "$GITHUB_OUTPUT"
+            echo 'upgrade_os_matrix=[]' >> "$GITHUB_OUTPUT"
+            echo 'run_heavy=false' >> "$GITHUB_OUTPUT"
+          fi
 
   validate:
     runs-on: ubuntu-latest
@@ -48,45 +83,77 @@ jobs:
       - run: echo "docs passed"
 
   package:
-    if: needs.compute-ci-level.outputs.full == 'true'
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
     needs: compute-ci-level
     strategy:
       fail-fast: false
       matrix:
-        test_os: [fedora-43, centos-10]
+        test_os: ${{ fromJson(needs.compute-ci-level.outputs.package_os_matrix) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: echo "package ${{ matrix.test_os }} passed"
 
   test-integration:
-    if: needs.compute-ci-level.outputs.full == 'true'
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
     needs: [compute-ci-level, package]
     strategy:
       fail-fast: false
       matrix:
-        test_os: [fedora-43, centos-10]
+        test_os: ${{ fromJson(needs.compute-ci-level.outputs.integration_os_matrix) }}
+        variant: [ostree, composefs]
+        filesystem: ["ext4", "xfs"]
+        bootloader: ["grub", "systemd"]
+        boot_type: ["bls", "uki"]
+        seal_state: ["sealed", "unsealed"]
+        exclude:
+          - test_os: centos-9
+            variant: composefs
+          - seal_state: "sealed"
+            boot_type: bls
+          - seal_state: "sealed"
+            bootloader: grub
+          - seal_state: "sealed"
+            filesystem: xfs
+          - seal_state: "unsealed"
+            filesystem: ext4
+            boot_type: uki
+          - bootloader: grub
+            boot_type: "uki"
+          - variant: ostree
+            filesystem: ext4
+          - variant: ostree
+            boot_type: uki
+          - variant: ostree
+            bootloader: systemd
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "test-integration ${{ matrix.test_os }} passed"
+      - run: echo "test-integration ${{ matrix.test_os }} ${{ matrix.variant }} ${{ matrix.filesystem }} ${{ matrix.bootloader }} ${{ matrix.boot_type }} ${{ matrix.seal_state }} passed"
 
   test-upgrade:
-    if: needs.compute-ci-level.outputs.full == 'true'
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
     needs: [compute-ci-level, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: ${{ fromJson(needs.compute-ci-level.outputs.upgrade_os_matrix) }}
+        variant: [ostree, composefs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "test-upgrade passed"
+      - run: echo "test-upgrade ${{ matrix.test_os }} ${{ matrix.variant }} passed"
 
   test-container-export:
-    if: needs.compute-ci-level.outputs.full == 'true'
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
     needs: [compute-ci-level, package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: echo "test-container-export passed"
 
+  # Sentinel job for required checks - configure this job name in repository settings.
+  # Accepts 'skipped' as success so that merge_group-only jobs don't block PRs.
   required-checks:
     if: always()
     needs: [compute-ci-level, cargo-deny, validate, install-tests, docs, package, test-integration, test-upgrade, test-container-export]
