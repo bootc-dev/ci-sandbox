@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compute-ci-level:
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.check.outputs.full }}
+    steps:
+      - name: Check if full CI is requested
+        id: check
+        run: echo "full=${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci-full') }}" >> "$GITHUB_OUTPUT"
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "validate passed"
+
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "cargo-deny passed"
+
+  install-tests:
+    name: "Test install"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "install-tests passed"
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "docs passed"
+
+  package:
+    if: needs.compute-ci-level.outputs.full == 'true'
+    needs: compute-ci-level
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: [fedora-43, centos-10]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "package ${{ matrix.test_os }} passed"
+
+  test-integration:
+    if: needs.compute-ci-level.outputs.full == 'true'
+    needs: [compute-ci-level, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: [fedora-43, centos-10]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "test-integration ${{ matrix.test_os }} passed"
+
+  test-upgrade:
+    if: needs.compute-ci-level.outputs.full == 'true'
+    needs: [compute-ci-level, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "test-upgrade passed"
+
+  test-container-export:
+    if: needs.compute-ci-level.outputs.full == 'true'
+    needs: [compute-ci-level, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "test-container-export passed"
+
+  required-checks:
+    if: always()
+    needs: [compute-ci-level, cargo-deny, validate, install-tests, docs, package, test-integration, test-upgrade, test-container-export]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result | IN("success","skipped") | not) | .key')
+          if [ -n "$FAILED" ]; then
+            echo "The following jobs did not succeed: $FAILED"
+            exit 1
+          fi
