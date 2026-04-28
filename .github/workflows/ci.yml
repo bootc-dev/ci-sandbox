@@ -1,0 +1,115 @@
+name: CI
+
+# This workflow demonstrates bors-like merge queue batching using GitHub's
+# native merge queue. Three tiers of jobs run depending on context:
+#
+#   tier-0  cheap checks (fmt, build sanity) — every PR, every queue entry
+#   tier-1  build matrix across OSes — labeled PRs (ci/tier-1), forced runs
+#   tier-2  full integration matrix — merge queue tip only (or forced)
+#
+# Non-tip queue entries run only tier-0 and then wait for the tip (which runs
+# the full suite) to get ALLGREEN before anything merges. This mirrors bors
+# semantics: the full suite runs once on the combined batch, not per-PR.
+#
+# REQUIREMENT: The merge queue MUST use ALLGREEN grouping ("Group pull
+# requests" in GitHub settings). Under HEADMERGE, non-tip entries would merge
+# immediately after passing cheap tests, bypassing the full suite entirely.
+
+permissions:
+  actions: read
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Determines what to run based on event context. See the annotated logic in
+  # .github/scripts/compute-ci-level.mjs for full details.
+  #
+  #   merge_group + tip of queue:    ci_level=tier-2  (full suite)
+  #   merge_group + not tip:         ci_level=tier-0  (cheap only, wait for tip)
+  #   merge_group + API failure:     ci_level=tier-2  (fail-safe)
+  #   workflow_dispatch / ci/merge:  ci_level=tier-2
+  #   PR with ci/tier-1 label:       ci_level=tier-1  (build matrix, no integration)
+  #   plain PR:                      ci_level=tier-0
+  compute-ci-level:
+    runs-on: ubuntu-latest
+    outputs:
+      ci_level: ${{ steps.matrix.outputs.ci_level }}
+      build_os_matrix: ${{ steps.matrix.outputs.build_os_matrix }}
+      integration_os_matrix: ${{ steps.matrix.outputs.integration_os_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute CI level
+        id: matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_BASE_REF: ${{ github.event.merge_group.base_ref || 'refs/heads/main' }}
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: node .github/scripts/compute-ci-level.mjs
+
+  # ── Tier-0: cheap checks, always run ─────────────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "fmt check passed"
+
+  # ── Tier-1: build matrix (labeled PRs, forced runs, merge queue tip) ──────
+  # Skipped on plain PRs and non-tip queue entries. "skipped" counts as
+  # passing for required-checks purposes.
+  build:
+    if: needs.compute-ci-level.outputs.build_os_matrix != '[]'
+    needs: compute-ci-level
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson(needs.compute-ci-level.outputs.build_os_matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "build on ${{ matrix.os }} passed"
+
+  # ── Tier-2: integration matrix (merge queue tip or forced only) ───────────
+  test-integration:
+    if: needs.compute-ci-level.outputs.integration_os_matrix != '[]'
+    needs: [compute-ci-level, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJson(needs.compute-ci-level.outputs.integration_os_matrix) }}
+        build_type: [debug, release]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "integration test (${{ matrix.build_type }}) on ${{ matrix.os }} passed"
+
+  # ── Sentinel ───────────────────────────────────────────────────────────────
+  # Configure "required-checks" as the required status check in repository
+  # settings. Accepts "skipped" as success so non-tip entries (which skip
+  # expensive jobs) still satisfy the branch protection rule.
+  required-checks:
+    if: always()
+    needs: [compute-ci-level, validate, build, test-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result | IN("success","skipped") | not) | .key')
+          if [ -n "$FAILED" ]; then
+            echo "The following jobs did not succeed: $FAILED"
+            exit 1
+          fi
+          echo "All jobs succeeded or were skipped."
