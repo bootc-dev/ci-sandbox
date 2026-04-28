@@ -1,0 +1,158 @@
+name: CI
+
+# This workflow demonstrates bors-like merge queue batching using GitHub's
+# native merge queue. Expensive jobs only run on the TIP of the queue batch;
+# earlier entries run only cheap checks and wait for ALLGREEN to pass.
+#
+# REQUIREMENT: The merge queue MUST use ALLGREEN grouping ("Group pull
+# requests" in GitHub settings). Under HEADMERGE, non-tip entries would merge
+# immediately after passing cheap tests, bypassing the full suite entirely.
+#
+# Works with all three merge methods (merge commit, rebase, squash) because
+# the queue branch tip commit SHA is what GITHUB_SHA reports in all cases,
+# and mergeQueue.entries.headCommit.oid always refers to that same commit.
+
+permissions:
+  actions: read
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Determines what to run based on event context. See the annotated logic in
+  # .github/scripts/compute-ci-level.mjs for full details.
+  #
+  #   merge_group + tip of queue:    run_heavy=true  (full suite)
+  #   merge_group + not tip:         run_heavy=false (cheap jobs only, wait for tip)
+  #   merge_group + API failure:     run_heavy=true  (fail-safe)
+  #   workflow_dispatch / ci/merge:  run_heavy=true
+  #   PR with ci/tier-1 label:       run_heavy=true, tier-1 OS subset only
+  #   plain PR:                      run_heavy=false
+  compute-ci-level:
+    runs-on: ubuntu-latest
+    outputs:
+      package_os_matrix: ${{ steps.matrix.outputs.package_os_matrix }}
+      integration_os_matrix: ${{ steps.matrix.outputs.integration_os_matrix }}
+      upgrade_os_matrix: ${{ steps.matrix.outputs.upgrade_os_matrix }}
+      run_heavy: ${{ steps.matrix.outputs.run_heavy }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute CI level
+        id: matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_BASE_REF: ${{ github.event.merge_group.base_ref || 'refs/heads/main' }}
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: node .github/scripts/compute-ci-level.mjs
+
+  # ── Cheap jobs: always run on each PR, and as part of the merge queue ────────────────────
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo fmt --check
+
+  # ── Expensive jobs (tip of queue only, or labeled PRs) ────────────────────
+  # Gated on run_heavy=true. For merge_group events, only the tip entry sets
+  # this. Earlier entries skip these entirely (status: skipped, which counts
+  # as passing for required-checks purposes).
+  package:
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
+    needs: compute-ci-level
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: ${{ fromJson(needs.compute-ci-level.outputs.package_os_matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "package ${{ matrix.test_os }} passed"
+
+  test-integration:
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
+    needs: [compute-ci-level, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: ${{ fromJson(needs.compute-ci-level.outputs.integration_os_matrix) }}
+        variant: [ostree, composefs]
+        filesystem: ["ext4", "xfs"]
+        bootloader: ["grub", "systemd"]
+        boot_type: ["bls", "uki"]
+        seal_state: ["sealed", "unsealed"]
+        exclude:
+          - test_os: centos-9
+            variant: composefs
+          - seal_state: "sealed"
+            boot_type: bls
+          - seal_state: "sealed"
+            bootloader: grub
+          - seal_state: "sealed"
+            filesystem: xfs
+          - seal_state: "unsealed"
+            filesystem: ext4
+            boot_type: uki
+          - bootloader: grub
+            boot_type: "uki"
+          - variant: ostree
+            filesystem: ext4
+          - variant: ostree
+            boot_type: uki
+          - variant: ostree
+            bootloader: systemd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "test-integration ${{ matrix.test_os }} ${{ matrix.variant }} ${{ matrix.filesystem }} ${{ matrix.bootloader }} ${{ matrix.boot_type }} ${{ matrix.seal_state }} passed"
+
+  test-upgrade:
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
+    needs: [compute-ci-level, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        test_os: ${{ fromJson(needs.compute-ci-level.outputs.upgrade_os_matrix) }}
+        variant: [ostree, composefs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "test-upgrade ${{ matrix.test_os }} ${{ matrix.variant }} passed"
+
+  test-container-export:
+    if: needs.compute-ci-level.outputs.run_heavy == 'true'
+    needs: [compute-ci-level, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "test-container-export passed"
+
+  # ── Sentinel ───────────────────────────────────────────────────────────────
+  # Configure "required-checks" as the required status check in repository
+  # settings. Accepts "skipped" as success so non-tip entries (which skip
+  # expensive jobs) still satisfy the branch protection rule.
+  required-checks:
+    if: always()
+    needs: [compute-ci-level, cargo-deny, validate, install-tests, docs, package, test-integration, test-upgrade, test-container-export]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result | IN("success","skipped") | not) | .key')
+          if [ -n "$FAILED" ]; then
+            echo "The following jobs did not succeed: $FAILED"
+            exit 1
+          fi
+          echo "All jobs succeeded or were skipped."
