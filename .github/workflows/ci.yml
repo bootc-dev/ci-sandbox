@@ -19,7 +19,9 @@ concurrency:
 
 jobs:
   # Determine the OS matrix for CI jobs based on context:
-  #   - merge_group / workflow_dispatch / ci/merge label: all OSes
+  #   - merge_group tip entry: full suite (all OSes)
+  #   - merge_group non-tip entry: skip heavy jobs (fast path)
+  #   - workflow_dispatch / ci/merge label: all OSes
   #   - ci/tier-1 label: centos-10 only (fast feedback on the primary target)
   #   - plain PR: no heavy jobs
   compute-ci-level:
@@ -32,11 +34,67 @@ jobs:
     steps:
       - name: Compute OS matrices
         id: matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_BASE_REF: ${{ github.event.merge_group.base_ref || 'refs/heads/main' }}
         run: |
           LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
           EVENT='${{ github.event_name }}'
 
-          if [[ "$EVENT" == "merge_group" || "$EVENT" == "workflow_dispatch" ]] \
+          if [[ "$EVENT" == "merge_group" ]]; then
+            OWNER="${GITHUB_REPOSITORY_OWNER}"
+            REPO="${GITHUB_REPOSITORY#*/}"
+            # Strip refs/heads/ prefix to get plain branch name
+            BRANCH="${MERGE_BASE_REF#refs/heads/}"
+
+            echo "Detecting merge queue tip for branch: $BRANCH"
+            echo "Current SHA: $GITHUB_SHA"
+
+            TIP_OID=$(gh api graphql -f query='
+              query($owner: String!, $repo: String!, $branch: String!) {
+                repository(owner: $owner, name: $repo) {
+                  mergeQueue(branch: $branch) {
+                    entries(last: 1) {
+                      nodes { headCommit { oid } }
+                    }
+                  }
+                }
+              }' -F owner="$OWNER" -F repo="$REPO" -F branch="$BRANCH" \
+              --jq '.data.repository.mergeQueue.entries.nodes[0].headCommit.oid' 2>/dev/null \
+              || echo "API_FAILED")
+
+            echo "Tip OID from API: $TIP_OID"
+
+            if [[ "$TIP_OID" == "API_FAILED" || -z "$TIP_OID" || "$TIP_OID" == "null" ]]; then
+              echo "WARNING: Could not determine queue tip, defaulting to full suite"
+              IS_TIP=true
+            elif [[ "$TIP_OID" == "$GITHUB_SHA" ]]; then
+              echo "This entry IS the queue tip - running full suite"
+              IS_TIP=true
+            else
+              echo "This entry is NOT the queue tip (tip=$TIP_OID) - skipping heavy jobs"
+              IS_TIP=false
+            fi
+
+            if [[ "$IS_TIP" == "true" ]]; then
+              echo 'package_os_matrix=["fedora-43","fedora-44","fedora-45","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
+              echo 'integration_os_matrix=["fedora-43","fedora-44","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
+              echo 'upgrade_os_matrix=["fedora-43","centos-10"]' >> "$GITHUB_OUTPUT"
+              echo 'run_heavy=true' >> "$GITHUB_OUTPUT"
+            else
+              echo 'package_os_matrix=[]' >> "$GITHUB_OUTPUT"
+              echo 'integration_os_matrix=[]' >> "$GITHUB_OUTPUT"
+              echo 'upgrade_os_matrix=[]' >> "$GITHUB_OUTPUT"
+              echo 'run_heavy=false' >> "$GITHUB_OUTPUT"
+            fi
+
+            echo "### Merge Queue Position" >> "$GITHUB_STEP_SUMMARY"
+            echo "- SHA: \`$GITHUB_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Tip SHA: \`$TIP_OID\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Is tip: **$IS_TIP**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- run_heavy: **$IS_TIP**" >> "$GITHUB_STEP_SUMMARY"
+
+          elif [[ "$EVENT" == "workflow_dispatch" ]] \
               || echo "$LABELS" | jq -e 'index("ci/merge")' > /dev/null; then
             # Full suite: all OSes
             echo 'package_os_matrix=["fedora-43","fedora-44","fedora-45","centos-9","centos-10"]' >> "$GITHUB_OUTPUT"
