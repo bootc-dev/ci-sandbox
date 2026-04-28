@@ -3,15 +3,19 @@
 //
 // Determines what CI jobs to run based on event context. For merge_group events,
 // queries the GitHub GraphQL API to detect whether this entry is the tip of the
-// queue batch. Only the tip runs expensive jobs; earlier entries run cheap checks
-// and wait for ALLGREEN to fire.
+// queue batch. Only the tip runs the full deep matrix; earlier entries run only
+// tier-0 cheap checks and wait for ALLGREEN to fire.
+//
+// Three levels:
+//   tier-0  cheap checks (fmt, build sanity) — always runs
+//   tier-1  basic OS matrix + light integration tests — merge queue, labeled PRs
+//   tier-2  full deep matrix — merge queue tip only (or forced)
 //
 // Outputs (via GITHUB_OUTPUT):
-//   run_heavy            - "true" | "false"
+//   ci_level             - "tier-0" | "tier-1" | "tier-2"
 //   reason               - human-readable explanation
-//   package_os_matrix    - JSON array of OS names
-//   integration_os_matrix
-//   upgrade_os_matrix
+//   build_os_matrix      - JSON array of OS names (tier-1+)
+//   integration_os_matrix - JSON array of OS names (tier-2 only)
 //
 // Usage: node compute-ci-level.mjs
 // Required env: GITHUB_OUTPUT, GITHUB_SHA, GITHUB_REPOSITORY,
@@ -23,42 +27,41 @@ import { appendFileSync } from "node:fs";
 
 // ── OS matrices ───────────────────────────────────────────────────────────────
 
-const FULL = {
-  package: ["fedora-43", "fedora-44", "fedora-45", "centos-9", "centos-10"],
-  integration: ["fedora-43", "fedora-44", "centos-9", "centos-10"],
-  upgrade: ["fedora-43", "centos-10"],
-};
-
+// Tier-1: a representative subset, fast feedback
 const TIER1 = {
-  package: ["centos-10"],
-  integration: ["centos-10"],
-  upgrade: ["centos-10"],
+  build: ["ubuntu-24.04", "fedora-44"],
+  integration: [],
 };
 
-const EMPTY = {
-  package: [],
+// Tier-2: full matrix run at merge queue tip
+const TIER2 = {
+  build: ["ubuntu-24.04", "fedora-44"],
+  integration: ["ubuntu-24.04", "fedora-44"],
+};
+
+// Tier-0: nothing beyond the cheap jobs themselves
+const TIER0 = {
+  build: [],
   integration: [],
-  upgrade: [],
 };
 
 // ── Output helpers ────────────────────────────────────────────────────────────
 
-function setOutputs(runHeavy, matrices, reason) {
+function setOutputs(level, matrices, reason) {
   const out = process.env.GITHUB_OUTPUT;
   const summary = process.env.GITHUB_STEP_SUMMARY;
   const lines = [
-    `run_heavy=${runHeavy}`,
+    `ci_level=${level}`,
     `reason=${reason}`,
-    `package_os_matrix=${JSON.stringify(matrices.package)}`,
+    `build_os_matrix=${JSON.stringify(matrices.build)}`,
     `integration_os_matrix=${JSON.stringify(matrices.integration)}`,
-    `upgrade_os_matrix=${JSON.stringify(matrices.upgrade)}`,
   ];
   for (const line of lines) {
     console.log(`  [output] ${line}`);
     if (out) appendFileSync(out, line + "\n");
   }
   if (summary) {
-    appendFileSync(summary, `**CI level:** \`${reason}\` (run_heavy=${runHeavy})\n`);
+    appendFileSync(summary, `**CI level:** \`${level}\` (${reason})\n`);
   }
 }
 
@@ -67,7 +70,7 @@ function setSummaryTable(sha, tipOid, isTip) {
   if (!summary) return;
   const tipLabel = isTip === null
     ? "⚠️ unknown (API failed — defaulted to full suite)"
-    : isTip ? "✅ yes — running full suite" : "⏭️ no — skipping expensive jobs";
+    : isTip ? "✅ yes — running full suite" : "⏭️ no — running tier-1 subset";
   appendFileSync(summary, [
     "",
     "### Merge Queue Position",
@@ -138,7 +141,7 @@ async function main() {
   // workflow_dispatch or ci/merge label → always full suite
   if (event === "workflow_dispatch" || labels.includes("ci/merge")) {
     console.log("Full suite: forced by event or label");
-    setOutputs(true, FULL, "forced-full-suite");
+    setOutputs("tier-2", TIER2, "forced-full-suite");
     return;
   }
 
@@ -158,7 +161,7 @@ async function main() {
       console.warn(`WARNING: Failed to fetch queue tip: ${err.message}`);
       console.warn("Defaulting to full suite (fail-safe)");
       setSummaryTable(sha, null, null);
-      setOutputs(true, FULL, "mq-tip-unknown-failsafe");
+      setOutputs("tier-2", TIER2, "mq-tip-unknown-failsafe");
       return;
     }
 
@@ -167,10 +170,10 @@ async function main() {
 
     if (isTip) {
       console.log("This entry IS the queue tip — running full suite");
-      setOutputs(true, FULL, "mq-tip");
+      setOutputs("tier-2", TIER2, "mq-tip");
     } else {
-      console.log(`This entry is NOT the queue tip (tip=${tipOid}) — skipping expensive jobs`);
-      setOutputs(false, EMPTY, "mq-not-tip");
+      console.log(`This entry is NOT the queue tip (tip=${tipOid}) — cheap checks only`);
+      setOutputs("tier-0", TIER0, "mq-not-tip");
     }
     return;
   }
@@ -178,13 +181,13 @@ async function main() {
   // PR with ci/tier-1 label → tier-1 subset
   if (labels.includes("ci/tier-1")) {
     console.log("Tier-1 suite: ci/tier-1 label");
-    setOutputs(true, TIER1, "label-tier-1");
+    setOutputs("tier-1", TIER1, "label-tier-1");
     return;
   }
 
   // Plain PR → cheap checks only
-  console.log("Plain PR — skipping expensive jobs");
-  setOutputs(false, EMPTY, "plain-pr");
+  console.log("Plain PR — tier-0 only");
+  setOutputs("tier-0", TIER0, "plain-pr");
 }
 
 main().catch((err) => {
