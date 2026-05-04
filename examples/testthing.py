@@ -988,7 +988,11 @@ class VirtualMachine:
     async def reboot(self) -> None:
         """Reboot the guest, waiting until it's back online."""
         async with self.disconnected():
-            await self.execute("reboot", direct=True)
+            # Use systemd-run --no-block so the reboot is scheduled as a
+            # transient background unit: SSH exits cleanly (0) before systemd
+            # starts tearing down processes, avoiding the race where sshd is
+            # killed before it can send SSH_MSG_DISCONNECT.
+            await self.execute("systemd-run --no-block reboot", direct=True)
 
     async def qmp(self, command: str) -> object:
         """Send a QMP command to the hypervisor.
