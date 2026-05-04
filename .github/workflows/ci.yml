@@ -129,7 +129,9 @@ jobs:
     strategy:
       matrix:
         example:
-          - { dir: 'bls', os: 'arch' }
+          # Disabled: Linux 7.0 kernel regression breaks composefs fsverity boot
+          # ("has no fs-verity digest"); see https://github.com/bootc-dev/bootc/issues/2174
+          # - { dir: 'bls', os: 'arch' }
           - { dir: 'bls', os: 'fedora' }
           - { dir: 'bls', os: 'fedora-compat' }
           # This one is currently failing, needs debugging
