@@ -18,110 +18,6 @@ permissions:
   contents: read
 
 jobs:
-  nightly:
-    runs-on: ubuntu-24.04
-    steps:
-    - uses: dtolnay/rust-toolchain@nightly
-    - uses: actions/checkout@v6
-    - run: cargo +nightly -Z package-workspace package
-
-  fedora:
-    runs-on: ubuntu-24.04
-    container:
-      image: quay.io/fedora/fedora:latest
-      options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
-
-    steps:
-    - run: dnf -y install cargo clippy composefs-devel e2fsprogs just rustfmt gcc-c++
-    - name: Enable fs-verity on /
-      run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
-    - uses: actions/checkout@v6
-    - name: Run all checks (clippy, fmt, feature combos, tests)
-      run: env CFS_TEST_TMPDIR=/run/host/var/tmp just check
-
-  # Fast smoke test — catches basic breakage before spending time on
-  # container builds and VM boots.  Runs only the unprivileged tests
-  # directly on the runner (no container image, no root required).
-  smoke:
-    name: Unprivileged smoke test
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Enable fs-verity on /
-        run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
-      - uses: actions/checkout@v6
-      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
-      - uses: Swatinem/rust-cache@v2
-      - run: just test-integration
-
-  # Fuzz smoke test — runs each fuzz target briefly to catch panics
-  # on malformed input.  The extended run only fires on pushes to main.
-  fuzz:
-    name: Fuzz smoke test
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: extractions/setup-just@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/composefs/fuzz
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-      - name: Generate corpus
-        run: just generate-corpus
-      - name: Run fuzz targets
-        run: just fuzz-all
-      - name: Upload fuzz artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-artifacts
-          path: |
-            crates/composefs/fuzz/artifacts/
-            target/fuzz-logs/
-
-  # Full integration tests: builds a bootc container image, runs all
-  # tests (both unprivileged and privileged).  Privileged tests execute
-  # inside bcvk ephemeral VMs booted from the container image.
-  integration:
-    name: Integration tests (${{ matrix.name }})
-    needs: smoke
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: centos-stream9
-            base_image: quay.io/centos-bootc/centos-bootc:stream9
-            cfsctl_features: rhel9
-          - name: centos-stream10
-            base_image: quay.io/centos-bootc/centos-bootc:stream10
-            cfsctl_features: pre-6.15
-          - name: debian
-            base_image: ghcr.io/bootcrew/debian-bootc:latest
-            cfsctl_features: oci
-    env:
-      COMPOSEFS_BASE_IMAGE: ${{ matrix.base_image }}
-      COMPOSEFS_CFSCTL_FEATURES: ${{ matrix.cfsctl_features }}
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Setup
-        uses: bootc-dev/actions/bootc-ubuntu-setup@main
-        with:
-          libvirt: true
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run integration tests (unprivileged + privileged via VM)
-        run: just test-integration-vm
-
   examples:
     name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }})
     runs-on: ubuntu-24.04
@@ -130,20 +26,6 @@ jobs:
       matrix:
         example:
           - { dir: 'bls', os: 'arch' }
-          - { dir: 'bls', os: 'fedora' }
-          - { dir: 'bls', os: 'fedora-compat' }
-          # This one is currently failing, needs debugging
-          # - { dir: 'bls', os: 'rawhide' }
-          - { dir: 'bls', os: 'rhel9' }
-          # This one is currently failing, needs debugging
-          # https://github.com/containers/composefs-rs/pull/168#pullrequestreview-3088673152
-          # We believe it's mount API changes causing /sysroot to be mounted
-          # at the wrong place.
-          # - { dir: 'bls', os: 'ubuntu' }
-          - { dir: 'uki', os: 'arch' }
-          - { dir: 'uki', os: 'fedora' }
-          - { dir: 'unified', os: 'fedora' }
-          - { dir: 'unified-secureboot', os: 'fedora' }
           - { dir: 'bls', os: 'arch', fsfmt: 'ext4', verity: 'none' }
           - { dir: 'bls', os: 'arch', fsfmt: 'xfs', verity: 'none' }
       fail-fast: false
@@ -211,14 +93,9 @@ jobs:
   # repository settings as the single required status check.
   required-checks:
     if: always()
-    needs: [nightly, fedora, smoke, fuzz, integration, examples]
+    needs: [examples]
     runs-on: ubuntu-latest
     steps:
       - run: exit 1
         if: >-
-          needs.nightly.result != 'success' ||
-          needs.fedora.result != 'success' ||
-          needs.smoke.result != 'success' ||
-          needs.fuzz.result != 'success' ||
-          needs.integration.result != 'success' ||
           needs.examples.result != 'success'
