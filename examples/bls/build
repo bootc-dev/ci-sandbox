@@ -41,6 +41,10 @@ esac
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
+# git does not store directory permissions; fix them so that the COPY extra /
+# layer in the container image doesn't make / /etc /usr etc. non-traversable
+# for non-root users (which would prevent e.g. dbus uid 81 from working).
+chmod -R a+rX extra/
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
