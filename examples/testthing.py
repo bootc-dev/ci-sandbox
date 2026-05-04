@@ -184,7 +184,7 @@ def _find_qemu() -> Path:
     raise FileNotFoundError("Unable to find qemu-kvm")
 
 
-def _find_ovmf() -> tuple[str, Path]:
+def _find_ovmf() -> tuple[tuple[str, ...], ...]:
     candidates = [
         # path for Fedora/RHEL (our tasks container)
         "/usr/share/OVMF/OVMF_CODE.fd",
@@ -196,7 +196,13 @@ def _find_ovmf() -> tuple[str, Path]:
 
     for path in map(Path, candidates):
         if path.exists():
-            return "-bios", path
+            # Use q35 machine type with pflash for OVMF. The older i440fx
+            # machine type used by default on some distros doesn't support
+            # loading OVMF via -bios, but q35 + pflash works universally.
+            return (
+                ("-machine", "q35"),
+                ("-drive", f"if=pflash,format=raw,readonly=on,file={path}"),
+            )
 
     raise FileNotFoundError("Unable to find OVMF UEFI BIOS")
 
@@ -618,7 +624,7 @@ class VirtualMachine:
         args = (
             _find_qemu(),
             "-nodefaults",
-            _find_ovmf(),
+            *_find_ovmf(),
             ("-cpu", "host"),
             ("-smp", f"{self._cpus}"),
             ("-m", f"{self._memory}"),
