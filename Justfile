@@ -8,7 +8,7 @@ selinux := env("BUILD_SELINUX", "true")
 
 options := if selinux == "true" { "-v /var/lib/containers:/var/lib/containers:Z -v /etc/containers:/etc/containers:Z -v /sys/fs/selinux:/sys/fs/selinux --security-opt label=type:unconfined_t" } else { "-v /var/lib/containers:/var/lib/containers -v /etc/containers:/etc/containers" }
 container_runtime := env("CONTAINER_RUNTIME", `command -v podman >/dev/null 2>&1 && echo podman || echo docker`)
-sudo_prefix := env("NOSUDO", "") != "" ? "" : "sudo "
+sudo_prefix := if env("NOSUDO", "") == "" { "sudo " } else { "" }
 
 # Build image and run an ephemeral VM for boot testing
 test IMAGE=image_name:
