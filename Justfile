@@ -8,13 +8,14 @@ selinux := env("BUILD_SELINUX", "true")
 
 options := if selinux == "true" { "-v /var/lib/containers:/var/lib/containers:Z -v /etc/containers:/etc/containers:Z -v /sys/fs/selinux:/sys/fs/selinux --security-opt label=type:unconfined_t" } else { "-v /var/lib/containers:/var/lib/containers -v /etc/containers:/etc/containers" }
 container_runtime := env("CONTAINER_RUNTIME", `command -v podman >/dev/null 2>&1 && echo podman || echo docker`)
+sudo_prefix := env("NOSUDO", "") != "" ? "" : "sudo "
 
 # Build image and run an ephemeral VM for boot testing
 test IMAGE=image_name:
     just bcvk build-and-test {{IMAGE}}
 
 build $image_name=image_name:
-    sudo {{container_runtime}} build -f {{image_name}}/Containerfile -t "${image_name}-bootc:latest" .
+    {{sudo_prefix}}{{container_runtime}} build -f {{image_name}}/Containerfile -t "${image_name}-bootc:latest" .
 
 bootc $image_name=image_name $image_tag=image_tag *ARGS:
     sudo {{container_runtime}} run \

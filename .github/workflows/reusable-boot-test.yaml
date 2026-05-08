@@ -24,9 +24,9 @@ jobs:
         run: |
           distro="${{ inputs.image-name }}"
           distro="${distro%-bootc}"
-          sudo $(which just) build "$distro"
-          # Copy to user podman storage so bcvk (runs as user) can find it
-          sudo podman save "${{ inputs.image-name }}:latest" | podman load
+          # Build as the runner user (no sudo) so the image lands directly in
+          # user podman storage where bcvk can find it.
+          NOSUDO=1 just build "$distro"
 
       - name: Boot test — SSH in and assert no failed units
         run: |
