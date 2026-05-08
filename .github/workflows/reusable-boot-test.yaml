@@ -1,0 +1,35 @@
+name: Boot Test
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Image name (e.g. debian-bootc)"
+        required: true
+        type: string
+
+jobs:
+  boot-test:
+    name: Boot test (${{ inputs.image-name }}, amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Setup bootc environment
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: 'true'
+
+      - name: Build image
+        run: |
+          distro="${{ inputs.image-name }}"
+          distro="${distro%-bootc}"
+          sudo $(which just) build "$distro"
+          # Copy to user podman storage so bcvk (runs as user) can find it
+          sudo podman save "${{ inputs.image-name }}:latest" | podman load
+
+      - name: Boot test — SSH in and assert no failed units
+        run: |
+          distro="${{ inputs.image-name }}"
+          distro="${distro%-bootc}"
+          just bcvk check "$distro"

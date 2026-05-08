@@ -24,8 +24,8 @@ check IMAGE:
     #!/bin/bash
     set -euo pipefail
     echo "==> Booting {{IMAGE}} and checking for failed units..."
-    failed=$(bcvk ephemeral run-ssh "{{IMAGE}}-bootc:latest" -- systemctl --failed --no-pager --no-legend 2>/dev/null || true)
-    echo "$failed"
+    failed=$(bcvk ephemeral run-ssh "{{IMAGE}}-bootc:latest" -- systemctl --failed --no-pager --no-legend)
+    printf '%s\n' "$failed"
     if [ -n "$failed" ]; then
         echo "FAIL: failed units detected in {{IMAGE}}" >&2
         exit 1
