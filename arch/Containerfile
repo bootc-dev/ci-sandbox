@@ -24,7 +24,15 @@ RUN pacman -Syu --noconfirm
 
 RUN pacman -Sy --noconfirm base bubblewrap dracut linux linux-firmware ostree btrfs-progs e2fsprogs xfsprogs dosfstools skopeo dbus dbus-glib glib2 ostree shadow openssh && pacman -S --clean --noconfirm
 
-RUN systemctl enable systemd-networkd systemd-resolved systemd-timesyncd sshd
+RUN systemctl enable systemd-networkd systemd-resolved systemd-timesyncd sshd && \
+    systemctl mask systemd-firstboot.service
+
+# Pre-configure basic system settings so the image is ready to boot without
+# interactive prompts.  machine-id is set to "uninitialized" so systemd
+# generates a unique ID on first boot; localtime must exist or systemd-firstboot
+# (if not masked) would prompt for timezone.
+RUN echo "uninitialized" > /etc/machine-id && \
+    ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 
 # Bring up any wired ethernet interface via DHCP.
 # systemd-networkd requires a .network file to manage an interface; without

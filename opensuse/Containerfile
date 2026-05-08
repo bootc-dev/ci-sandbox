@@ -18,7 +18,21 @@ COPY --from=builder /output /
 
 RUN zypper install -y btrfs-progs bubblewrap cpio dosfstools dracut dracut e2fsprogs glib2 kernel-default kernel-firmware-all openssh ostree skopeo systemd systemd-networkd systemd-resolved systemd-boot udev xfsprogs zstd libcrypto57 chrony
 
-RUN systemctl enable systemd-networkd systemd-resolved chronyd sshd
+RUN systemctl enable systemd-networkd systemd-resolved chronyd sshd && \
+    systemctl mask systemd-firstboot.service
+
+# Pre-configure basic system settings so the image boots without interactive
+# prompts. machine-id is "uninitialized" so systemd generates a unique ID on
+# first boot; localtime already points at UTC via the /usr/etc merge below.
+RUN echo "uninitialized" > /etc/machine-id
+
+# OpenSUSE's sshd.service does not include Before/Wants=ssh-access.target
+# (that is done by systemd-ssh-generator which OpenSUSE doesn't ship). bcvk
+# waits for ssh-access.target before SSHing in, so we add a drop-in to wire
+# sshd into that target.
+RUN mkdir -p /usr/lib/systemd/system/sshd.service.d && \
+    printf '[Unit]\nBefore=ssh-access.target\nWants=ssh-access.target\n' \
+    > /usr/lib/systemd/system/sshd.service.d/10-ssh-access-target.conf
 
 # Bring up any wired ethernet interface via DHCP — same pattern as
 # composefs-rs examples, matching by Type=ether to catch all naming
@@ -39,7 +53,21 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     echo "HOME=/var/home" | tee -a "/etc/default/useradd" && \
     /ctx/shared/bootc-rootfs.sh
 
-RUN rm -rf /usr/etc
+# OpenSUSE ships vendor config in /usr/etc (e.g. sshd_config, nsswitch.conf,
+# PAM security configs). bootc requires /usr/etc to be absent, so we merge
+# /usr/etc → /etc without overwriting files already placed by packages.
+RUN cp -rn /usr/etc/. /etc/ && rm -rf /usr/etc
+
+# The OpenSUSE chrony package ships a config with the NTP pool disabled
+# (prefixed with '!'). Write a minimal working config so chronyd starts.
+RUN printf '# NTP pool — four servers for reliability\npool pool.ntp.org iburst\n\ndriftfile /var/lib/chrony/drift\nmakestep 1.0 3\nrtcsync\nntsdumpdir /var/lib/chrony\nlogdir /var/log/chrony\n' \
+    > /etc/chrony.conf
+
+# bootc-rootfs.sh removes /var entirely; chrony's service requires /var/lib/chrony
+# to exist at startup (ProtectSystem=strict, ReadWritePaths=/var/lib/chrony).
+# Create it at first boot via tmpfiles.d.
+RUN printf 'd /var/lib/chrony 0750 chrony chrony\n' \
+    >> /usr/lib/tmpfiles.d/chrony.conf
 
 LABEL containers.bootc 1
 
