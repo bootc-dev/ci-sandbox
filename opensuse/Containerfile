@@ -20,6 +20,14 @@ RUN zypper install -y btrfs-progs bubblewrap cpio dosfstools dracut dracut e2fsp
 
 RUN systemctl enable NetworkManager chronyd sshd
 
+# Wildcard NM connection: bring up any ethernet interface via DHCP.
+# Without an explicit connection profile, NM may not manage the QEMU virtio
+# NIC if no other connection matches it (e.g., no cloud-init/ifcfg files).
+RUN mkdir -p /etc/NetworkManager/system-connections && \
+    printf '[connection]\nid=ethernet-dhcp\ntype=ethernet\nautoconnect-priority=-999\n\n[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n' \
+    > /etc/NetworkManager/system-connections/10-ethernet-dhcp.nmconnection && \
+    chmod 600 /etc/NetworkManager/system-connections/10-ethernet-dhcp.nmconnection
+
 RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root \
     --mount=type=bind,from=ctx,source=/,target=/ctx \
     /ctx/shared/initramfs.sh
