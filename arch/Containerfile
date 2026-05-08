@@ -26,11 +26,13 @@ RUN pacman -Sy --noconfirm base bubblewrap dracut linux linux-firmware ostree bt
 
 RUN systemctl enable systemd-networkd systemd-resolved systemd-timesyncd sshd
 
-# Wildcard network config: bring up any en*/eth* interface via DHCP.
+# Bring up any wired ethernet interface via DHCP.
 # systemd-networkd requires a .network file to manage an interface; without
 # one it silently ignores all NICs (including the QEMU virtio NIC).
-RUN printf '[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\n' \
-    > /usr/lib/systemd/network/10-ethernet.network
+# Match by Type=ether rather than by name to catch all naming conventions
+# (ens3, enp0s3, eth0, etc.) — same approach used in composefs-rs examples.
+RUN printf '[Match]\nType=ether\n\n[Network]\nDHCP=yes\n' \
+    > /usr/lib/systemd/network/20-wired.network
 
 # Point resolv.conf at systemd-resolved's stub via tmpfiles.d so it's
 # created correctly at first boot (can't symlink during build; resolv.conf

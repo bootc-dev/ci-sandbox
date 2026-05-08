@@ -16,17 +16,20 @@ FROM base AS system
 
 COPY --from=builder /output /
 
-RUN zypper install -y btrfs-progs bubblewrap cpio dosfstools dracut dracut e2fsprogs glib2 kernel-default kernel-firmware-all NetworkManager openssh ostree skopeo systemd systemd-boot udev xfsprogs zstd libcrypto57 chrony
+RUN zypper install -y btrfs-progs bubblewrap cpio dosfstools dracut dracut e2fsprogs glib2 kernel-default kernel-firmware-all openssh ostree skopeo systemd systemd-networkd systemd-resolved systemd-boot udev xfsprogs zstd libcrypto57 chrony
 
-RUN systemctl enable NetworkManager chronyd sshd
+RUN systemctl enable systemd-networkd systemd-resolved chronyd sshd
 
-# Wildcard NM connection: bring up any ethernet interface via DHCP.
-# Without an explicit connection profile, NM may not manage the QEMU virtio
-# NIC if no other connection matches it (e.g., no cloud-init/ifcfg files).
-RUN mkdir -p /etc/NetworkManager/system-connections && \
-    printf '[connection]\nid=ethernet-dhcp\ntype=ethernet\nautoconnect-priority=-999\n\n[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n' \
-    > /etc/NetworkManager/system-connections/10-ethernet-dhcp.nmconnection && \
-    chmod 600 /etc/NetworkManager/system-connections/10-ethernet-dhcp.nmconnection
+# Bring up any wired ethernet interface via DHCP — same pattern as
+# composefs-rs examples, matching by Type=ether to catch all naming
+# conventions (ens3, enp0s3, eth0, etc.).
+RUN printf '[Match]\nType=ether\n\n[Network]\nDHCP=yes\n' \
+    > /usr/lib/systemd/network/20-wired.network
+
+# Point resolv.conf at systemd-resolved's stub at first boot.
+RUN printf 'L! /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n' \
+    > /usr/lib/tmpfiles.d/resolv-conf.conf
+
 
 RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root \
     --mount=type=bind,from=ctx,source=/,target=/ctx \
