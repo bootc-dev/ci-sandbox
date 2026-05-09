@@ -1,0 +1,50 @@
+name: Test GitHub Models API
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  test-github-models:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install openai package
+        run: pip install openai
+
+      - name: Call GitHub Models API
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'EOF'
+          import openai, os, sys
+
+          token = os.environ.get("GITHUB_TOKEN")
+          if not token:
+              print("ERROR: GITHUB_TOKEN not set")
+              sys.exit(1)
+
+          print(f"Token starts with: {token[:20]}...")
+
+          client = openai.OpenAI(
+              base_url="https://models.inference.ai.azure.com",
+              api_key=token,
+          )
+
+          try:
+              resp = client.chat.completions.create(
+                  model="gpt-4o-mini",
+                  messages=[{"role": "user", "content": "Say hello from GitHub Models in one sentence."}],
+                  max_tokens=50,
+              )
+              print("SUCCESS! Response:")
+              print(resp.choices[0].message.content)
+              print(f"Model used: {resp.model}")
+          except Exception as e:
+              print(f"ERROR: {e}")
+              sys.exit(1)
+          EOF
