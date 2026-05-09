@@ -127,13 +127,25 @@ jobs:
           echo "Goose config written:"
           cat ~/.config/goose/config.yaml
 
+      - name: Debug - test raw API call
+        run: |
+          echo "Testing raw API call to GitHub Models..."
+          # First verify the endpoint works directly
+          curl -s -o /tmp/api_test.json -w "HTTP_CODE:%{http_code}" \
+            -X POST "https://models.inference.ai.azure.com/v1/chat/completions" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi"}],"max_tokens":10}'
+          echo "Raw API response:"
+          cat /tmp/api_test.json
+
       - name: Run Goose non-interactively
         id: goose_run
         run: |
           echo "Running Goose with GitHub Models backend..."
           echo "OPENAI_HOST=${OPENAI_HOST}"
           set +e
-          GOOSE_OUTPUT=$(goose run \
+          GOOSE_OUTPUT=$(RUST_LOG=debug goose run \
             --no-session \
             --provider openai \
             --model gpt-4o-mini \
