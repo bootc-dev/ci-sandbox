@@ -88,14 +88,14 @@ jobs:
 
   test-goose:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      models: read
+      issues: write
     env:
       GITHUB_TOKEN: ${{ github.token }}
       # Goose OpenAI provider picks up OPENAI_API_KEY and OPENAI_HOST
-      OPENAI_API_KEY: ${{ github.token }}
       OPENAI_HOST: https://models.inference.ai.azure.com
-      # Also set advanced provider vars as fallback
-      GOOSE_PROVIDER__HOST: https://models.inference.ai.azure.com
-      GOOSE_PROVIDER__API_KEY: ${{ github.token }}
       # Disable session naming to avoid extra model calls
       GOOSE_DISABLE_SESSION_NAMING: "true"
       TEST_ISSUE_NUMBER: 59
@@ -130,10 +130,11 @@ jobs:
       - name: Debug - test raw API call
         run: |
           echo "Testing raw API call to GitHub Models..."
-          # First verify the endpoint works directly
-          curl -s -o /tmp/api_test.json -w "HTTP_CODE:%{http_code}" \
+          echo "GITHUB_TOKEN starts with: ${GITHUB_TOKEN:0:15}..."
+          # Use GITHUB_TOKEN (auto-injected) directly
+          curl -s -o /tmp/api_test.json -w "\nHTTP_CODE:%{http_code}\n" \
             -X POST "https://models.inference.ai.azure.com/v1/chat/completions" \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi"}],"max_tokens":10}'
           echo "Raw API response:"
@@ -144,8 +145,11 @@ jobs:
         run: |
           echo "Running Goose with GitHub Models backend..."
           echo "OPENAI_HOST=${OPENAI_HOST}"
+          # Set OPENAI_API_KEY from GITHUB_TOKEN for Goose
+          export OPENAI_API_KEY="${GITHUB_TOKEN}"
+          export GOOSE_PROVIDER__API_KEY="${GITHUB_TOKEN}"
           set +e
-          GOOSE_OUTPUT=$(RUST_LOG=debug goose run \
+          GOOSE_OUTPUT=$(goose run \
             --no-session \
             --provider openai \
             --model gpt-4o-mini \
