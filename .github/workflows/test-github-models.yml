@@ -85,3 +85,95 @@ jobs:
               -X POST -f body="${BODY}"
             echo "Created new comment on issue #${TEST_ISSUE_NUMBER}"
           fi
+
+  test-goose:
+    runs-on: ubuntu-24.04
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENAI_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+      OPENAI_HOST: https://models.inference.ai.azure.com
+      TEST_ISSUE_NUMBER: 59
+    steps:
+      - name: Install Goose CLI
+        run: |
+          set -e
+          echo "Downloading Goose v1.33.1 for Linux x86_64..."
+          curl -fsSL \
+            https://github.com/aaif-goose/goose/releases/download/v1.33.1/goose-x86_64-unknown-linux-gnu.tar.gz \
+            -o goose.tar.gz
+          tar -xzf goose.tar.gz
+          sudo mv goose /usr/local/bin/goose
+          chmod +x /usr/local/bin/goose
+          rm goose.tar.gz
+          goose --version
+
+      - name: Configure Goose for GitHub Models
+        run: |
+          mkdir -p ~/.config/goose
+          cat > ~/.config/goose/config.yaml << 'EOF'
+          GOOSE_PROVIDER: openai
+          GOOSE_MODEL: gpt-4o-mini
+          EOF
+          echo "Goose config written:"
+          cat ~/.config/goose/config.yaml
+
+      - name: Run Goose non-interactively
+        id: goose_run
+        run: |
+          echo "Running Goose with GitHub Models backend..."
+          set +e
+          GOOSE_OUTPUT=$(goose run \
+            --no-session \
+            --provider openai \
+            --model gpt-4o-mini \
+            -t "Write a one-sentence greeting mentioning that you are running inside GitHub Actions. Then stop." \
+            2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          echo "Exit code: $EXIT_CODE"
+          echo "--- Goose output ---"
+          echo "$GOOSE_OUTPUT"
+          echo "--- End output ---"
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "Goose run failed with exit code $EXIT_CODE"
+            exit 1
+          fi
+
+          # Write output for next step
+          {
+            echo "goose_output<<GOOSE_EOF"
+            echo "$GOOSE_OUTPUT"
+            echo "GOOSE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post Goose result to issue
+        run: |
+          SENTINEL="<!-- test-goose-comment -->"
+          TIMESTAMP=$(date -u)
+          GOOSE_OUTPUT="${{ steps.goose_run.outputs.goose_output }}"
+
+          BODY="${SENTINEL}
+          ## Goose Agent Test (GitHub Actions + GitHub Models)
+
+          Last run: ${TIMESTAMP}
+
+          **Goose output:**
+          \`\`\`
+          ${GOOSE_OUTPUT}
+          \`\`\`"
+
+          # Find existing comment with the sentinel
+          COMMENT_ID=$(gh api "repos/bootc-dev/ci-sandbox/issues/${TEST_ISSUE_NUMBER}/comments" \
+            --jq '[.[] | select(.body | contains("'"${SENTINEL}"'"))] | .[0].id // empty')
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/bootc-dev/ci-sandbox/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+            echo "Updated existing Goose comment ID: ${COMMENT_ID}"
+          else
+            gh api "repos/bootc-dev/ci-sandbox/issues/${TEST_ISSUE_NUMBER}/comments" \
+              -X POST -f body="${BODY}"
+            echo "Created new Goose comment on issue #${TEST_ISSUE_NUMBER}"
+          fi
