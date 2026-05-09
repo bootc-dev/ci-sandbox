@@ -93,10 +93,7 @@ jobs:
       models: read
       issues: write
     env:
-      GITHUB_TOKEN: ${{ github.token }}
-      # Goose OpenAI provider picks up OPENAI_API_KEY and OPENAI_HOST
       OPENAI_HOST: https://models.inference.ai.azure.com
-      # Disable session naming to avoid extra model calls
       GOOSE_DISABLE_SESSION_NAMING: "true"
       TEST_ISSUE_NUMBER: 59
     steps:
@@ -127,27 +124,23 @@ jobs:
           echo "Goose config written:"
           cat ~/.config/goose/config.yaml
 
-      - name: Debug - test raw API call
+      - name: Debug - test raw API call and token
         run: |
-          echo "Testing raw API call to GitHub Models..."
           echo "GITHUB_TOKEN starts with: ${GITHUB_TOKEN:0:15}..."
-          # Use GITHUB_TOKEN (auto-injected) directly
-          curl -s -o /tmp/api_test.json -w "\nHTTP_CODE:%{http_code}\n" \
+          echo "Testing raw API call to models.inference.ai.azure.com..."
+          HTTP_CODE=$(curl -s -o /tmp/api_test.json -w "%{http_code}" \
             -X POST "https://models.inference.ai.azure.com/v1/chat/completions" \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi"}],"max_tokens":10}'
-          echo "Raw API response:"
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hi"}],"max_tokens":10}')
+          echo "HTTP status: ${HTTP_CODE}"
           cat /tmp/api_test.json
 
       - name: Run Goose non-interactively
         id: goose_run
         run: |
           echo "Running Goose with GitHub Models backend..."
-          echo "OPENAI_HOST=${OPENAI_HOST}"
-          # Set OPENAI_API_KEY from GITHUB_TOKEN for Goose
           export OPENAI_API_KEY="${GITHUB_TOKEN}"
-          export GOOSE_PROVIDER__API_KEY="${GITHUB_TOKEN}"
           set +e
           GOOSE_OUTPUT=$(goose run \
             --no-session \
