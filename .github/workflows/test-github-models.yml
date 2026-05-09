@@ -8,17 +8,20 @@ on:
 permissions:
   contents: read
   models: read
+  issues: write
 
 jobs:
   test-github-models:
     runs-on: ubuntu-24.04
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TEST_ISSUE_NUMBER: 59
     steps:
       - name: Install openai package
         run: pip install openai
 
       - name: Call GitHub Models API
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: llm
         run: |
           python3 << 'EOF'
           import openai, os, sys
@@ -41,10 +44,44 @@ jobs:
                   messages=[{"role": "user", "content": "Say hello from GitHub Models in one sentence."}],
                   max_tokens=50,
               )
+              content = resp.choices[0].message.content
               print("SUCCESS! Response:")
-              print(resp.choices[0].message.content)
+              print(content)
               print(f"Model used: {resp.model}")
+
+              # Write to GITHUB_OUTPUT for use in next step
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  # Use a delimiter to handle multi-line safely
+                  f.write("llm_response<<LLM_EOF\n")
+                  f.write(content + "\n")
+                  f.write("LLM_EOF\n")
           except Exception as e:
               print(f"ERROR: {e}")
               sys.exit(1)
           EOF
+
+      - name: Update issue comment
+        run: |
+          SENTINEL="<!-- test-github-models-comment -->"
+          TIMESTAMP=$(date -u)
+          LLM_RESPONSE="${{ steps.llm.outputs.llm_response }}"
+
+          BODY="${SENTINEL}
+          ## GitHub Models Test
+
+          Last run: ${TIMESTAMP}
+          LLM said: ${LLM_RESPONSE}"
+
+          # Find existing comment with the sentinel
+          COMMENT_ID=$(gh api "repos/bootc-dev/ci-sandbox/issues/${TEST_ISSUE_NUMBER}/comments" \
+            --jq '[.[] | select(.body | contains("'"${SENTINEL}"'"))] | .[0].id // empty')
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/bootc-dev/ci-sandbox/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="${BODY}"
+            echo "Updated existing comment ID: ${COMMENT_ID}"
+          else
+            gh api "repos/bootc-dev/ci-sandbox/issues/${TEST_ISSUE_NUMBER}/comments" \
+              -X POST -f body="${BODY}"
+            echo "Created new comment on issue #${TEST_ISSUE_NUMBER}"
+          fi
