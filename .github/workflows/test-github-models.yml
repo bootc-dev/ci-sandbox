@@ -89,13 +89,13 @@ jobs:
   test-goose:
     runs-on: ubuntu-24.04
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ github.token }}
       # Goose OpenAI provider picks up OPENAI_API_KEY and OPENAI_HOST
-      OPENAI_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+      OPENAI_API_KEY: ${{ github.token }}
       OPENAI_HOST: https://models.inference.ai.azure.com
       # Also set advanced provider vars as fallback
       GOOSE_PROVIDER__HOST: https://models.inference.ai.azure.com
-      GOOSE_PROVIDER__API_KEY: ${{ secrets.GITHUB_TOKEN }}
+      GOOSE_PROVIDER__API_KEY: ${{ github.token }}
       # Disable session naming to avoid extra model calls
       GOOSE_DISABLE_SESSION_NAMING: "true"
       TEST_ISSUE_NUMBER: 59
