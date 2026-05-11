@@ -1,5 +1,5 @@
 {
-  "name": "bootcrew-devenv-debian",
+  "name": "bootc-devenv-debian",
   "image": "ghcr.io/bootc-dev/devenv-debian",
   "customizations": {
     "vscode": {

@@ -1,5 +1,5 @@
 {
-  "name": "bootcrew-devenv-ubuntu",
+  "name": "bootc-devenv-ubuntu",
   "image": "ghcr.io/bootc-dev/devenv-ubuntu",
   "customizations": {
     "vscode": {
