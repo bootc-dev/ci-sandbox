@@ -59,15 +59,23 @@ jobs:
         run: node .github/scripts/compute-ci-level.mjs
 
   # ── Tier-0: cheap checks, always run ─────────────────────────────────────
+  # Touch ci/fail-validate in the branch to simulate a tier-0 failure.
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "fmt check passed"
+      - name: fmt check
+        run: |
+          if [ -f ci/fail-validate ]; then
+            echo "Simulated validate failure (ci/fail-validate present)"
+            exit 1
+          fi
+          echo "fmt check passed"
 
   # ── Tier-1: build matrix (labeled PRs, forced runs, merge queue tip) ──────
   # Skipped on plain PRs and non-tip queue entries. "skipped" counts as
   # passing for required-checks purposes.
+  # Touch ci/fail-build in the branch to simulate a tier-1 failure.
   build:
     if: needs.compute-ci-level.outputs.build_os_matrix != '[]'
     needs: compute-ci-level
@@ -78,9 +86,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: echo "build on ${{ matrix.os }} passed"
+      - name: build
+        run: |
+          if [ -f ci/fail-build ]; then
+            echo "Simulated build failure (ci/fail-build present)"
+            exit 1
+          fi
+          echo "build on ${{ matrix.os }} passed"
 
   # ── Tier-2: integration matrix (merge queue tip or forced only) ───────────
+  # Touch ci/fail-integration in the branch to simulate a tier-2 failure.
   test-integration:
     if: needs.compute-ci-level.outputs.integration_os_matrix != '[]'
     needs: [compute-ci-level, build]
@@ -92,18 +107,51 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: echo "integration test (${{ matrix.build_type }}) on ${{ matrix.os }} passed"
+      - name: integration test
+        run: |
+          if [ -f ci/fail-integration ]; then
+            echo "Simulated integration failure (ci/fail-integration present)"
+            exit 1
+          fi
+          echo "integration test (${{ matrix.build_type }}) on ${{ matrix.os }} passed"
 
-  # ── Sentinel ───────────────────────────────────────────────────────────────
-  # Configure "required-checks" as the required status check in repository
-  # settings. Accepts "skipped" as success so non-tip entries (which skip
-  # expensive jobs) still satisfy the branch protection rule.
-  required-checks:
-    if: always()
+  # ── Sentinels ─────────────────────────────────────────────────────────────
+  #
+  # Two-job sentinel pattern so that the ci/merge label (which triggers tier-2
+  # on a PR for early feedback) does not block merge-queue entry if a heavy job
+  # flakes.  RPM/package artifacts expire quickly and re-runs are expensive, so
+  # we want the merge queue to re-run those jobs fresh rather than requiring
+  # them to be green before the PR can even be queued.
+  #
+  #   required-checks-merge  — gates the full suite; only runs in merge_group /
+  #                            workflow_dispatch; skipped on plain PRs.
+  #   required-checks        — the single name to configure in repo settings;
+  #                            gates tier-0 jobs + required-checks-merge (which
+  #                            is "skipped" == success on PRs).
+  #
+  required-checks-merge:
+    if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') }}
     needs: [compute-ci-level, validate, build, test-integration]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result | IN("success","skipped") | not) | .key')
+          if [ -n "$FAILED" ]; then
+            echo "The following jobs did not succeed: $FAILED"
+            exit 1
+          fi
+          echo "All jobs succeeded or were skipped."
+
+  # Configure "required-checks" as the required status check in repo settings.
+  required-checks:
+    if: always()
+    needs: [compute-ci-level, validate, required-checks-merge]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required jobs
         env:
           NEEDS: ${{ toJson(needs) }}
         run: |
