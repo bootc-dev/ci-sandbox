@@ -1,0 +1,1 @@
+This PR uses ci/merge label but has ci/fail-build. Key test: required-checks should still go green on the PR so it can enter the merge queue.
