@@ -28,15 +28,17 @@ import { appendFileSync } from "node:fs";
 // ── OS matrices ───────────────────────────────────────────────────────────────
 
 // Tier-1: a representative subset, fast feedback
+// (ubuntu-only for sandbox — real projects would expand this matrix)
 const TIER1 = {
-  build: ["ubuntu-24.04", "fedora-44"],
+  build: ["ubuntu-24.04"],
   integration: [],
 };
 
 // Tier-2: full matrix run at merge queue tip
+// (ubuntu-only for sandbox — real projects would expand this matrix)
 const TIER2 = {
-  build: ["ubuntu-24.04", "fedora-44"],
-  integration: ["ubuntu-24.04", "fedora-44"],
+  build: ["ubuntu-24.04"],
+  integration: ["ubuntu-24.04"],
 };
 
 // Tier-0: nothing beyond the cheap jobs themselves
