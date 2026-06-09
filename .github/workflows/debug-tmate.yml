@@ -71,10 +71,44 @@ jobs:
           HINTS
 
       - name: Start tmate session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
-          timeout-minutes: 30
+        run: |
+          # Install tmate if not present
+          if ! command -v tmate &>/dev/null; then
+            if command -v dnf &>/dev/null; then
+              dnf install -y tmate
+            else
+              apt-get install -y tmate
+            fi
+          fi
+
+          # Start the tmate session
+          tmate -S /tmp/tmate.sock new-session -d -s debug
+          tmate -S /tmp/tmate.sock wait tmate-ready
+
+          # Get the connection strings
+          SSH_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+
+          echo "==================================="
+          echo "tmate SSH: $SSH_URL"
+          echo "tmate Web: $WEB_URL"
+          echo "==================================="
+
+          # Write to step summary so it's readable via API
+          {
+            echo "## tmate session"
+            echo ""
+            echo "**SSH:** \`${SSH_URL}\`"
+            echo ""
+            echo "**Web:** ${WEB_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Wait for /tmp/continue or 30 min timeout
+          DEADLINE=$(($(date +%s) + 1800))
+          while [ ! -f /tmp/continue ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            echo "Waiting... SSH: $SSH_URL"
+            sleep 5
+          done
 
   debug-plain:
     if: ${{ inputs.runner == 'plain-ubuntu' }}
