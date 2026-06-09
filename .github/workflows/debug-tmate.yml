@@ -53,18 +53,24 @@ jobs:
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
           mkdir -p ~/.config/opencode
+          # Use @ai-sdk/openai-compatible (chat/completions API) not built-in openai
+          # provider (which uses /responses — not supported by GitHub Models).
+          # The baseURL must end in /v1 for the SDK to append /chat/completions correctly.
           jq -n --arg key "$MODELS_TOKEN" '{
             "$schema": "https://opencode.ai/config.json",
-            "model": "openai/gpt-4.1",
+            "model": "github-models/gpt-4.1",
             "autoupdate": false,
             "permission": "allow",
             "provider": {
-              "openai": {
-                "api": "https://models.github.ai/inference",
-                "options": {"apiKey": $key},
+              "github-models": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "GitHub Models",
+                "options": {
+                  "baseURL": "https://models.github.ai/inference/v1",
+                  "apiKey": $key
+                },
                 "models": {
                   "gpt-4.1": {
-                    "id": "openai/gpt-4.1",
                     "name": "GPT-4.1 (GitHub Models)",
                     "attachment": true,
                     "reasoning": false,
@@ -79,10 +85,10 @@ jobs:
           echo "Config:"
           cat ~/.config/opencode/config.json
 
-      - name: Test opencode run (60s timeout)
+      - name: Test opencode run (90s timeout)
         run: |
           echo "## opencode output" >> "$GITHUB_STEP_SUMMARY"
-          RESULT=$(timeout 60 opencode run \
+          RESULT=$(timeout 90 opencode run \
             --print-logs \
             --dangerously-skip-permissions \
             "say hello in exactly 3 words, nothing else" 2>&1) || true

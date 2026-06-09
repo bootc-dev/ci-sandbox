@@ -2,8 +2,10 @@
 # them using opencode via GitHub Models (models.github.ai).
 #
 # Auth: MODELS_TOKEN is a fine-grained PAT with organization_models:read on
-# bootc-dev. It's used as the API key for the github-models opencode provider
-# which talks to https://models.github.ai/inference (OpenAI-compatible API).
+# bootc-dev. It's used as the API key for a custom opencode provider backed by
+# @ai-sdk/openai-compatible, pointing at https://models.github.ai/inference/v1
+# (chat/completions API — the built-in openai provider uses /responses which
+# GitHub Models does not support).
 #
 # Required secrets:
 #   APP_ID / APP_PRIVATE_KEY  - GitHub App (contents:write + pull-requests:write)
@@ -59,27 +61,29 @@ jobs:
         run: npm install -g opencode-ai
 
       # Configure opencode to use GitHub Models via a custom provider.
-      # models.github.ai exposes an OpenAI-compatible API; we point the
-      # built-in openai provider at it using MODELS_TOKEN as the key.
+      # The built-in "openai" provider uses the Responses API (/responses),
+      # which GitHub Models does not support. Instead we use the
+      # @ai-sdk/openai-compatible npm package which uses /chat/completions.
       - name: Configure opencode for GitHub Models
         env:
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
           mkdir -p ~/.config/opencode
-          # Schema: https://opencode.ai/config.json
-          # Key is "provider" (singular), with options.apiKey and api URL.
           jq -n --arg key "$MODELS_TOKEN" '{
             "$schema": "https://opencode.ai/config.json",
-            "model": "openai/gpt-4.1",
+            "model": "github-models/gpt-4.1",
             "autoupdate": false,
             "permission": "allow",
             "provider": {
-              "openai": {
-                "api": "https://models.github.ai/inference",
-                "options": {"apiKey": $key},
+              "github-models": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "GitHub Models",
+                "options": {
+                  "baseURL": "https://models.github.ai/inference/v1",
+                  "apiKey": $key
+                },
                 "models": {
                   "gpt-4.1": {
-                    "id": "openai/gpt-4.1",
                     "name": "GPT-4.1 via GitHub Models",
                     "attachment": true,
                     "reasoning": false,
