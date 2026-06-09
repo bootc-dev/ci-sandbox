@@ -1,0 +1,96 @@
+name: Run Agent
+description: >
+  Run opencode against GitHub Models (gpt-4.1 via @ai-sdk/openai-compatible).
+  Reads the prompt from `prompt-file` (default: /tmp/agent-prompt.txt).
+  The prompt MUST instruct the model to write its output to `output-file`
+  using the write tool — the action verifies the file is non-empty after the run.
+
+inputs:
+  models-token:
+    description: Fine-grained PAT with models:read scope for GitHub Models.
+    required: true
+  prompt-file:
+    description: Path to a file containing the full prompt.
+    default: /tmp/agent-prompt.txt
+  output-file:
+    description: Path the prompt must instruct the model to write output to.
+    default: /tmp/agent-output.md
+  model:
+    description: Model identifier (provider/model).
+    default: github-models/gpt-4.1
+
+outputs:
+  output-file:
+    description: Path to the file containing the agent's output.
+    value: ${{ inputs.output-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install opencode
+      shell: bash
+      run: npm install -g opencode-ai
+
+    - name: Configure opencode for GitHub Models
+      shell: bash
+      env:
+        MODELS_TOKEN: ${{ inputs.models-token }}
+      run: |
+        # @ai-sdk/openai-compatible uses /chat/completions; the built-in openai
+        # provider uses /responses which GitHub Models does not support.
+        # baseURL must end in /v1 for the SDK to append /chat/completions.
+        echo "OPENCODE_CONFIG_CONTENT=$(jq -cn --arg key "$MODELS_TOKEN" '{
+          "$schema": "https://opencode.ai/config.json",
+          "model": "github-models/gpt-4.1",
+          "autoupdate": false,
+          "permission": "allow",
+          "agent": {
+            "compaction": {"model": "github-models/gpt-4.1-mini"},
+            "title":      {"model": "github-models/gpt-4.1-mini"},
+            "summary":    {"model": "github-models/gpt-4.1-mini"}
+          },
+          "provider": {
+            "github-models": {
+              "npm": "@ai-sdk/openai-compatible",
+              "name": "GitHub Models",
+              "options": {
+                "baseURL": "https://models.github.ai/inference/v1",
+                "apiKey": $key
+              },
+              "models": {
+                "gpt-4.1": {
+                  "id": "openai/gpt-4.1",
+                  "name": "GPT-4.1",
+                  "attachment": true, "reasoning": false, "tool_call": true,
+                  "temperature": false, "limit": {"context": 1047576, "output": 32768}
+                },
+                "gpt-4.1-mini": {
+                  "id": "openai/gpt-4.1-mini",
+                  "name": "GPT-4.1-mini",
+                  "attachment": true, "reasoning": false, "tool_call": true,
+                  "temperature": false, "limit": {"context": 1047576, "output": 32768}
+                }
+              }
+            }
+          }
+        }')" >> "$GITHUB_ENV"
+
+    - name: Run agent
+      shell: bash
+      env:
+        PROMPT_FILE: ${{ inputs.prompt-file }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        opencode run \
+          --model "$MODEL" \
+          --print-logs \
+          --dangerously-skip-permissions \
+          "$(cat "$PROMPT_FILE")"
+
+        if [ ! -s "$OUTPUT_FILE" ]; then
+          echo "::error::Agent did not write output to $OUTPUT_FILE" >&2
+          exit 1
+        fi
+        echo "=== Agent output ==="
+        cat "$OUTPUT_FILE"

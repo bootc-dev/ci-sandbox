@@ -1,10 +1,9 @@
 # Agentic merge-queue monitor: when the CI workflow fails on a merge-queue run,
-# analyse the failure with opencode (via GitHub Models gpt-4.1) and post a
-# debugging comment on the originating PR.
+# analyse the failure with opencode (via GitHub Models) and post a debugging
+# comment on the originating PR.
 #
-# Trigger: workflow_run fires after CI completes with conclusion, head_branch,
-# and head_sha available — unlike merge_group which fires at queue entry start
-# and carries no failure info.
+# The agent is invoked via .github/actions/run-agent — all opencode bootstrap
+# boilerplate (install, config, provider setup) lives there.
 #
 # Auth:
 #   APP_ID / APP_PRIVATE_KEY  - GitHub App: contents:write, pull-requests:write
@@ -35,9 +34,12 @@ jobs:
     # actionable as code regressions.
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
+      # Checkout needed so .github/actions/run-agent is available.
+      - uses: actions/checkout@v4
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v2
@@ -143,68 +145,12 @@ jobs:
             echo "(no failed-step logs available)" > /tmp/failed-log.txt
           fi
 
-      - name: Install opencode
-        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
-        run: npm install -g opencode-ai
-
-      # Uses @ai-sdk/openai-compatible (chat/completions) — the built-in openai
-      # provider uses /responses which GitHub Models does not support.
-      - name: Configure opencode for GitHub Models
-        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
-        env:
-          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
-        run: |
-          echo "OPENCODE_CONFIG_CONTENT=$(jq -cn --arg key "$MODELS_TOKEN" '{
-            "$schema": "https://opencode.ai/config.json",
-            "model": "github-models/gpt-4.1",
-            "autoupdate": false,
-            "permission": "allow",
-            "agent": {
-              "compaction": {"model": "github-models/gpt-4.1-mini"},
-              "title":      {"model": "github-models/gpt-4.1-mini"},
-              "summary":    {"model": "github-models/gpt-4.1-mini"}
-            },
-            "provider": {
-              "github-models": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "GitHub Models",
-                "options": {
-                  "baseURL": "https://models.github.ai/inference/v1",
-                  "apiKey": $key
-                },
-                "models": {
-                  "gpt-4.1": {
-                    "id": "openai/gpt-4.1",
-                    "name": "GPT-4.1",
-                    "attachment": true, "reasoning": false, "tool_call": true,
-                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
-                  },
-                  "gpt-4.1-mini": {
-                    "id": "openai/gpt-4.1-mini",
-                    "name": "GPT-4.1-mini",
-                    "attachment": true, "reasoning": false, "tool_call": true,
-                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
-                  }
-                }
-              }
-            }
-          }')" >> "$GITHUB_ENV"
-
       # -----------------------------------------------------------------------
-      # Build prompt and run the analysis (single LLM call).
+      # Build the prompt, then run the agent via the shared composite action.
       # -----------------------------------------------------------------------
-      - name: Analyse failure with opencode
-        id: analyze
+      - name: Build prompt
         if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
-        timeout-minutes: 5
-        env:
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
-          set -euo pipefail
-
-          # opencode run's model response goes to the terminal, not stdout.
-          # We instruct the model to write its output to a file using the
-          # write tool, then verify the file exists after the run.
           {
             echo "You are a CI reliability engineer for the bootc project."
             echo "A CI run failed in the merge queue. Analyse the failure below."
@@ -230,19 +176,17 @@ jobs:
             echo ""
             echo "IMPORTANT: Write your analysis to the file /tmp/analysis.md using"
             echo "the write tool. Do not just print it — write it to that file."
-          } > /tmp/prompt.txt
+          } > /tmp/agent-prompt.txt
 
-          opencode run \
-            --model github-models/gpt-4.1 \
-            --print-logs \
-            --dangerously-skip-permissions \
-            "$(cat /tmp/prompt.txt)"
-
-          if [ ! -s /tmp/analysis.md ]; then
-            echo "opencode did not write /tmp/analysis.md" >&2; exit 1
-          fi
-          echo "=== Analysis ==="
-          cat /tmp/analysis.md
+      - name: Run agent
+        id: analyze
+        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
+        timeout-minutes: 5
+        uses: ./.github/actions/run-agent
+        with:
+          models-token: ${{ secrets.MODELS_TOKEN }}
+          prompt-file: /tmp/agent-prompt.txt
+          output-file: /tmp/analysis.md
 
       - name: Upload analysis artifact
         if: ${{ always() && steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}

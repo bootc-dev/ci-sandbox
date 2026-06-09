@@ -1,15 +1,12 @@
 # Agentic CI monitor: polls recent CI failures / merge queue and summarises
-# them using opencode via GitHub Models (models.github.ai).
+# them using opencode via GitHub Models.
 #
-# Auth: MODELS_TOKEN is a fine-grained PAT with organization_models:read on
-# bootc-dev. It's used as the API key for a custom opencode provider backed by
-# @ai-sdk/openai-compatible, pointing at https://models.github.ai/inference/v1
-# (chat/completions API — the built-in openai provider uses /responses which
-# GitHub Models does not support).
+# The agent is invoked via .github/actions/run-agent — all opencode bootstrap
+# boilerplate (install, config, provider setup) lives there.
 #
 # Required secrets:
 #   APP_ID / APP_PRIVATE_KEY  - GitHub App (contents:write + pull-requests:write)
-#   MODELS_TOKEN              - fine-grained PAT with organization_models:read
+#   MODELS_TOKEN              - fine-grained PAT with models:read
 
 name: Agentic CI Monitor
 
@@ -47,7 +44,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
@@ -57,58 +54,10 @@ jobs:
           git config user.name  "bootc-ci-bot[bot]"
           git config user.email "bootc-ci-bot[bot]@users.noreply.github.com"
 
-      - name: Install opencode
-        run: npm install -g opencode-ai
-
-      # Configure opencode via OPENCODE_CONFIG_CONTENT env var — avoids file
-      # precedence issues. Uses @ai-sdk/openai-compatible (chat/completions)
-      # since the built-in openai provider uses /responses which GitHub Models
-      # does not support. Main model: gpt-4o; sub-tasks: gpt-4o-mini.
-      - name: Configure opencode for GitHub Models
-        env:
-          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
-        run: |
-          echo "OPENCODE_CONFIG_CONTENT=$(jq -cn --arg key "$MODELS_TOKEN" '{
-            "$schema": "https://opencode.ai/config.json",
-            "model": "github-models/gpt-4.1",
-            "autoupdate": false,
-            "permission": "allow",
-            "agent": {
-              "compaction": {"model": "github-models/gpt-4.1-mini"},
-              "title":      {"model": "github-models/gpt-4.1-mini"},
-              "summary":    {"model": "github-models/gpt-4.1-mini"}
-            },
-            "provider": {
-              "github-models": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "GitHub Models",
-                "options": {
-                  "baseURL": "https://models.github.ai/inference/v1",
-                  "apiKey": $key
-                },
-                "models": {
-                  "gpt-4.1": {
-                    "id": "openai/gpt-4.1",
-                    "name": "GPT-4.1",
-                    "attachment": true, "reasoning": false, "tool_call": true,
-                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
-                  },
-                  "gpt-4.1-mini": {
-                    "id": "openai/gpt-4.1-mini",
-                    "name": "GPT-4.1-mini",
-                    "attachment": true, "reasoning": false, "tool_call": true,
-                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
-                  }
-                }
-              }
-            }
-          }')" >> "$GITHUB_ENV"
-
       # -----------------------------------------------------------------------
       # Collect CI failure data
       # -----------------------------------------------------------------------
       - name: Collect recent CI failures
-        id: collect
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -135,14 +84,12 @@ jobs:
             | jq '.' > /tmp/merge-queue.json || echo '[]' > /tmp/merge-queue.json
 
       # -----------------------------------------------------------------------
-      # Run opencode analysis
+      # Build the prompt, then run the agent via the shared composite action.
       # -----------------------------------------------------------------------
-      - name: Analyse with opencode
+      - name: Build prompt
         env:
           EXTRA: ${{ github.event.inputs.extra_prompt }}
         run: |
-          set -euo pipefail
-
           {
             echo "You are a CI reliability engineer reviewing the bootc project."
             echo ""
@@ -171,15 +118,18 @@ jobs:
             echo "2. Distinguish transient failures from probable regressions."
             echo "3. Name likely culprit commits/PRs for any regression."
             echo "4. Recommend one concrete next action per issue group."
-          } > /tmp/prompt.txt
+            echo ""
+            echo "IMPORTANT: Write your report to the file /tmp/ci-analysis.md using"
+            echo "the write tool. Do not just print it — write it to that file."
+          } > /tmp/agent-prompt.txt
 
-          opencode run \
-            --dangerously-skip-permissions \
-            "$(cat /tmp/prompt.txt)" \
-            > /tmp/ci-analysis.md
-
-          echo "=== Analysis ==="
-          cat /tmp/ci-analysis.md
+      - name: Run agent
+        id: analyze
+        uses: ./.github/actions/run-agent
+        with:
+          models-token: ${{ secrets.MODELS_TOKEN }}
+          prompt-file: /tmp/agent-prompt.txt
+          output-file: /tmp/ci-analysis.md
 
       - name: Upload CI analysis artifact
         if: always()
@@ -193,7 +143,7 @@ jobs:
       # Push directly to main (push_to_main=true, dry_run=false)
       # -----------------------------------------------------------------------
       - name: Commit analysis directly to main
-        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main == 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main == 'true' && steps.analyze.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -209,7 +159,7 @@ jobs:
       # Open a PR (default: dry_run=false, push_to_main=false)
       # -----------------------------------------------------------------------
       - name: Open PR with analysis report
-        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main != 'true' && steps.analyze.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
