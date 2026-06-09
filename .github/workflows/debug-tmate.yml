@@ -41,7 +41,7 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Write tokens and print hints
+      - name: Write tokens and run diagnostics
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -49,26 +49,85 @@ jobs:
           echo "$APP_TOKEN"     > /tmp/app-token
           echo "$BUILTIN_TOKEN" > /tmp/builtin-token
           chmod 600 /tmp/app-token /tmp/builtin-token
-          cat <<'HINTS'
-          === Tokens written to /tmp/app-token (ghs_... App token) and /tmp/builtin-token (GITHUB_TOKEN) ===
 
-          # Copilot token exchange:
-          curl -s -H "Authorization: Bearer $(cat /tmp/app-token)" \
+          echo "=== Token prefixes ==="
+          echo -n "App token first 15 chars: "; head -c 15 /tmp/app-token; echo ""
+          echo -n "Builtin token first 15 chars: "; head -c 15 /tmp/builtin-token; echo ""
+
+          echo ""
+          echo "=== Copilot token exchange with App token ==="
+          COPILOT_APP=$(curl -s -H "Authorization: Bearer $(cat /tmp/app-token)" \
             -H 'User-Agent: GitHubCopilotChat/0.35.0' \
             -H 'Editor-Version: vscode/1.107.0' \
             -H 'Editor-Plugin-Version: copilot-chat/0.35.0' \
             -H 'Copilot-Integration-Id: vscode-chat' \
-            https://api.github.com/copilot_internal/v2/token | jq .
+            https://api.github.com/copilot_internal/v2/token)
+          echo "$COPILOT_APP" | jq .
 
-          # GitHub Models inference:
-          curl -s -X POST -H "Authorization: Bearer $(cat /tmp/app-token)" \
+          echo ""
+          echo "=== Copilot token exchange with builtin GITHUB_TOKEN ==="
+          COPILOT_BUILTIN=$(curl -s -H "Authorization: Bearer $(cat /tmp/builtin-token)" \
+            -H 'User-Agent: GitHubCopilotChat/0.35.0' \
+            -H 'Editor-Version: vscode/1.107.0' \
+            -H 'Editor-Plugin-Version: copilot-chat/0.35.0' \
+            -H 'Copilot-Integration-Id: vscode-chat' \
+            https://api.github.com/copilot_internal/v2/token)
+          echo "$COPILOT_BUILTIN" | jq .
+
+          echo ""
+          echo "=== GitHub Models with App token ==="
+          MODELS_APP=$(curl -s -X POST -H "Authorization: Bearer $(cat /tmp/app-token)" \
             -H 'Content-Type: application/json' \
             https://models.github.ai/inference/chat/completions \
-            -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+            -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"say hello in 5 words"}],"max_tokens":20}')
+          echo "$MODELS_APP" | jq .
 
-          # opencode:
-          opencode --version
-          HINTS
+          echo ""
+          echo "=== GitHub Models with builtin token ==="
+          MODELS_BUILTIN=$(curl -s -X POST -H "Authorization: Bearer $(cat /tmp/builtin-token)" \
+            -H 'Content-Type: application/json' \
+            https://models.github.ai/inference/chat/completions \
+            -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"say hello in 5 words"}],"max_tokens":20}')
+          echo "$MODELS_BUILTIN" | jq .
+
+          # Post results to issue #59 for easy retrieval
+          APP_TOKEN_VAL=$(cat /tmp/app-token)
+          APP_PREFIX=$(head -c 15 /tmp/app-token)
+          BUILTIN_PREFIX=$(head -c 15 /tmp/builtin-token)
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY="## Diagnostic results for run [${GITHUB_RUN_ID}](${RUN_URL})
+
+**App token prefix:** \`${APP_PREFIX}\`
+**Builtin token prefix:** \`${BUILTIN_PREFIX}\`
+
+### Copilot exchange (App token)
+\`\`\`json
+${COPILOT_APP}
+\`\`\`
+
+### Copilot exchange (Builtin GITHUB_TOKEN)
+\`\`\`json
+${COPILOT_BUILTIN}
+\`\`\`
+
+### GitHub Models (App token)
+\`\`\`json
+${MODELS_APP}
+\`\`\`
+
+### GitHub Models (Builtin token)
+\`\`\`json
+${MODELS_BUILTIN}
+\`\`\`"
+
+          curl -s -X POST \
+            -H "Authorization: Bearer ${APP_TOKEN_VAL}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/59/comments" \
+            -d "$(jq -n --arg body "$BODY" '{body: $body}')" \
+            | jq '{id: .id, created_at: .created_at}'
+
+          touch /tmp/continue
 
       - name: Start tmate session
         run: |
