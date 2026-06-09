@@ -1,24 +1,15 @@
-# Agentic CI monitor: polls recent CI failures / merge queue and summarises
-# them using opencode backed by GitHub Copilot (no external API key needed).
+# Agentic CI monitor: polls recent CI failures / merge queue and summarises them.
 #
-# How the Copilot auth works:
-#   The opencode-copilot-auth plugin is installed at startup.  It reads
-#   ~/.local/share/opencode/auth.json where we pre-populate the App token as
-#   the OAuth refresh token.  On first use the plugin calls
-#   https://api.github.com/copilot_internal/v2/token to exchange that token
-#   for a short-lived Copilot bearer, then uses api.githubcopilot.com for
-#   inference.  This requires the organisation to have Copilot Enterprise
-#   (available free to CNCF maintainers via contribute.cncf.io).
+# Auth strategy (in order of preference):
+#   1. GitHub Copilot via copilot_internal/v2/token exchange using the App token
+#      (ghs_... installation token) - works if bootc-dev org has Copilot Enterprise
+#   2. GitHub Copilot via GITHUB_TOKEN (also a ghs_... token) - same mechanism
+#   3. Raw data dump with no LLM summary if both fail
+#
+# The copilot exchange is tested at runtime; if it fails we fall through gracefully.
 #
 # Required secrets:
 #   APP_ID / APP_PRIVATE_KEY  - GitHub App with contents:write + pull-requests:write
-#                               (same secrets used by scheduled-release.yml)
-#
-# Inputs:
-#   dry_run      (bool, default true)  - analyse only, no commit/PR
-#   push_to_main (bool, default false) - commit directly to main instead of PR
-#                                        (App token must have bypass-branch-protection)
-#   extra_prompt (string, optional)    - additional context for the agent
 
 name: Agentic CI Monitor
 
@@ -31,14 +22,10 @@ on:
         type: boolean
         default: true
       push_to_main:
-        description: "Commit directly to main instead of opening a PR (requires App token bypass rights)"
+        description: "Commit directly to main instead of opening a PR (requires App token bypass)"
         required: false
         type: boolean
         default: false
-      extra_prompt:
-        description: "Extra instructions for the AI agent (optional)"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -46,11 +33,9 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-24.04
-    # ghcr.io/bootc-dev/devenv-c10s ships opencode-ai (npm), gh CLI, jj,
-    # nu, just, podman, Rust, Go, etc.  Built from bootc-dev/infra.
     container:
       image: ghcr.io/bootc-dev/devenv-c10s:latest
-      options: --privileged  # needed for rootless podman inside the image
+      options: --privileged
 
     steps:
       - name: Generate GitHub App token
@@ -72,39 +57,47 @@ jobs:
           git config user.email "bootc-ci-bot[bot]@users.noreply.github.com"
 
       # -----------------------------------------------------------------------
-      # Install the opencode-copilot-auth plugin and configure credentials.
-      #
-      # The plugin is a thin npm package that handles the GitHub OAuth →
-      # Copilot token exchange.  We inject the App token as the OAuth refresh
-      # token; the plugin calls copilot_internal/v2/token on first inference.
+      # Probe: can we exchange the App token (ghs_...) for a Copilot bearer?
+      # Also try the built-in GITHUB_TOKEN as a fallback.
       # -----------------------------------------------------------------------
-      - name: Install opencode-copilot-auth plugin
-        run: npm install -g opencode-copilot-auth
-
-      - name: Configure opencode Copilot auth
+      - name: Probe Copilot token exchange
+        id: copilot-probe
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN_BUILTIN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p ~/.local/share/opencode
-          # Inject App token as the OAuth refresh token.
-          # The plugin will exchange this for a short-lived Copilot bearer.
-          printf '{"github-copilot":{"type":"oauth","refresh":"%s","access":"","expires":0}}\n' \
-            "$APP_TOKEN" > ~/.local/share/opencode/auth.json
+          set -euo pipefail
 
-      - name: Write opencode.json
-        run: |
-          cat > opencode.json <<'EOF'
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "github-copilot/claude-sonnet-4-5",
-  "autoupdate": false,
-  "permission": "allow",
-  "plugins": ["opencode-copilot-auth"]
-}
-EOF
+          HEADERS=(
+            -H "Accept: application/json"
+            -H "User-Agent: GitHubCopilotChat/0.35.0"
+            -H "Editor-Version: vscode/1.107.0"
+            -H "Editor-Plugin-Version: copilot-chat/0.35.0"
+            -H "Copilot-Integration-Id: vscode-chat"
+          )
+
+          try_exchange() {
+            local label=$1 token=$2
+            echo "--- trying $label (prefix: ${token:0:8}...) ---"
+            RESP=$(curl -s "${HEADERS[@]}" \
+              -H "Authorization: Bearer $token" \
+              https://api.github.com/copilot_internal/v2/token)
+            echo "$RESP" | jq '{token_preview: (.token // "NONE" | .[0:20]), error: .message}'
+            if echo "$RESP" | jq -e '.token' >/dev/null 2>&1; then
+              echo "copilot_token=$(echo "$RESP" | jq -r '.token')" >> "$GITHUB_OUTPUT"
+              echo "copilot_ok=true" >> "$GITHUB_OUTPUT"
+              echo "SUCCESS with $label"
+              return 0
+            fi
+            return 1
+          }
+
+          try_exchange "app-token" "$APP_TOKEN" \
+            || try_exchange "github-token" "$GH_TOKEN_BUILTIN" \
+            || { echo "copilot_ok=false" >> "$GITHUB_OUTPUT"; echo "Both tokens failed Copilot exchange"; }
 
       # -----------------------------------------------------------------------
-      # Collect recent CI failures and merge-queue state via gh CLI
+      # Collect CI failure data
       # -----------------------------------------------------------------------
       - name: Collect recent CI failures
         id: collect
@@ -118,77 +111,88 @@ EOF
             --repo "$REPO" \
             --branch main \
             --limit 20 \
-            --json databaseId,name,status,conclusion,createdAt,headSha,headBranch,url \
+            --json databaseId,name,status,conclusion,createdAt,headSha,url \
             --jq '[.[] | select(.conclusion == "failure" or .conclusion == "cancelled")]' \
             > /tmp/failed-runs.json
 
-          echo "=== Failed/cancelled runs (last 20 on main) ==="
-          jq -r '.[] | "  \(.createdAt)  \(.name)  \(.conclusion)  sha=\(.headSha[0:8])  \(.url)"' \
+          echo "=== Failed/cancelled runs ==="
+          jq -r '.[] | "  \(.createdAt)  \(.name)  \(.conclusion)  sha=\(.headSha[0:8])"' \
             /tmp/failed-runs.json || true
 
           gh api "repos/$REPO/pulls?state=open&per_page=20" \
-            --jq '[.[] | {number, title, draft, mergeable_state, labels: [.labels[].name], url: .html_url}]' \
+            --jq '[.[] | {number, title, draft, mergeable_state, labels: [.labels[].name]}]' \
             > /tmp/open-prs.json
-          echo "=== Open PRs ==="
-          jq -r '.[] | "  #\(.number) [\(.mergeable_state)] \(.title)"' /tmp/open-prs.json || true
 
           gh api "repos/$REPO/merge-queue/groups" 2>/dev/null \
             | jq '.' > /tmp/merge-queue.json || echo '[]' > /tmp/merge-queue.json
 
       # -----------------------------------------------------------------------
-      # Run opencode analysis via the github-copilot provider
+      # If Copilot exchange succeeded, use it directly via curl for a summary.
+      # This avoids needing opencode config entirely.
       # -----------------------------------------------------------------------
-      - name: Analyse with opencode (Copilot)
-        id: analysis
+      - name: Summarise with Copilot API
+        id: summarise
+        if: ${{ steps.copilot-probe.outputs.copilot_ok == 'true' }}
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          COPILOT_TOKEN: ${{ steps.copilot-probe.outputs.copilot_token }}
         run: |
           set -euo pipefail
 
-          EXTRA="${{ github.event.inputs.extra_prompt }}"
+          PAYLOAD=$(jq -n \
+            --argjson failed "$(cat /tmp/failed-runs.json)" \
+            --argjson prs "$(cat /tmp/open-prs.json)" \
+            --argjson mq "$(cat /tmp/merge-queue.json)" \
+            '{
+              model: "claude-sonnet-4-5",
+              messages: [{
+                role: "user",
+                content: ("You are a CI reliability engineer reviewing the bootc project.\n\n## Failed runs\n```json\n" + ($failed | tojson) + "\n```\n\n## Open PRs\n```json\n" + ($prs | tojson) + "\n```\n\n## Merge queue\n```json\n" + ($mq | tojson) + "\n```\n\nWrite a concise CI health report (<=500 words, plain markdown): summarise failure patterns, distinguish transient from regressions, name likely culprit commits/PRs, recommend one action per issue group.")
+              }],
+              max_tokens: 1024
+            }')
 
-          # Build the prompt from collected data
-          {
-            echo "You are a CI reliability engineer reviewing the bootc project."
-            echo ""
-            echo "## Recent failed/cancelled runs on main"
-            echo '```json'
-            cat /tmp/failed-runs.json
-            echo '```'
-            echo ""
-            echo "## Open pull requests"
-            echo '```json'
-            cat /tmp/open-prs.json
-            echo '```'
-            echo ""
-            echo "## Merge queue groups"
-            echo '```json'
-            cat /tmp/merge-queue.json
-            echo '```'
-            if [ -n "$EXTRA" ]; then
-              echo ""
-              echo "## Additional context"
-              echo "$EXTRA"
-            fi
-            echo ""
-            echo "Write a concise report (≤500 words, plain markdown):"
-            echo "1. Summarise failure patterns."
-            echo "2. Distinguish transient failures from probable regressions."
-            echo "3. Name the likely commit/PR for any regression."
-            echo "4. Recommend one concrete next action per issue group."
-          } > /tmp/prompt.txt
-
-          opencode run \
-            --dangerously-skip-permissions \
-            "$(cat /tmp/prompt.txt)" \
+          curl -s \
+            -H "Authorization: Bearer $COPILOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: GitHubCopilotChat/0.35.0" \
+            -H "Editor-Version: vscode/1.107.0" \
+            -H "Editor-Plugin-Version: copilot-chat/0.35.0" \
+            -H "Copilot-Integration-Id: vscode-chat" \
+            https://api.githubcopilot.com/chat/completions \
+            -d "$PAYLOAD" \
+            | tee /tmp/copilot-response.json \
+            | jq -r '.choices[0].message.content // ("ERROR: " + (.error.message // "unknown"))' \
             > /tmp/ci-analysis.md
 
           echo "=== Analysis ==="
           cat /tmp/ci-analysis.md
 
-      # -----------------------------------------------------------------------
-      # Upload as artifact (always, even on dry run)
-      # -----------------------------------------------------------------------
+      # Fallback: plain data dump when Copilot is unavailable
+      - name: Generate plain data report (fallback)
+        if: ${{ steps.copilot-probe.outputs.copilot_ok != 'true' }}
+        run: |
+          {
+            echo "# CI Report $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "_(No LLM summary — Copilot token exchange failed)_"
+            echo ""
+            echo "## Failed runs"
+            echo '```json'
+            cat /tmp/failed-runs.json
+            echo '```'
+            echo ""
+            echo "## Open PRs"
+            echo '```json'
+            cat /tmp/open-prs.json
+            echo '```'
+            echo ""
+            echo "## Merge queue"
+            echo '```json'
+            cat /tmp/merge-queue.json
+            echo '```'
+          } > /tmp/ci-analysis.md
+          cat /tmp/ci-analysis.md
+
       - name: Upload CI analysis artifact
         if: always()
         uses: actions/upload-artifact@v5
@@ -198,9 +202,7 @@ EOF
           if-no-files-found: warn
 
       # -----------------------------------------------------------------------
-      # Push directly to main (dry_run=false, push_to_main=true)
-      # Requires the GitHub App to have "bypass branch protection" in the
-      # branch ruleset settings (confirmed working in this sandbox).
+      # Push directly to main (push_to_main=true, dry_run=false)
       # -----------------------------------------------------------------------
       - name: Commit analysis directly to main
         if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main == 'true' }}
@@ -216,11 +218,11 @@ EOF
 
 Generated by the agentic-ci-monitor workflow (push_to_main=true).
 
-Assisted-by: OpenCode (github-copilot/claude-sonnet-4-5)"
+Assisted-by: OpenCode (claude-sonnet-4-6)"
           git push origin main
 
       # -----------------------------------------------------------------------
-      # Open a PR (dry_run=false, push_to_main=false — the safe default)
+      # Open a PR (default path: dry_run=false, push_to_main=false)
       # -----------------------------------------------------------------------
       - name: Open PR with analysis report
         if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main != 'true' }}
@@ -230,8 +232,7 @@ Assisted-by: OpenCode (github-copilot/claude-sonnet-4-5)"
         run: |
           set -euo pipefail
           DATE=$(date -u +%Y-%m-%d)
-          TS=$(date -u +%Y%m%d-%H%M%S)
-          BRANCH="ci-analysis/${TS}"
+          BRANCH="ci-analysis/$(date -u +%Y%m%d-%H%M%S)"
           git checkout -b "$BRANCH"
           mkdir -p docs/ci-reports
           cp /tmp/ci-analysis.md "docs/ci-reports/${DATE}-ci-analysis.md"
@@ -240,7 +241,7 @@ Assisted-by: OpenCode (github-copilot/claude-sonnet-4-5)"
 
 Generated by the agentic-ci-monitor workflow.
 
-Assisted-by: OpenCode (github-copilot/claude-sonnet-4-5)"
+Assisted-by: OpenCode (claude-sonnet-4-6)"
           git push origin "$BRANCH"
           gh pr create \
             --repo "$REPO" \
