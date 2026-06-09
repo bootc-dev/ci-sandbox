@@ -50,6 +50,11 @@ jobs:
           echo "$BUILTIN_TOKEN" > /tmp/builtin-token
           chmod 600 /tmp/app-token /tmp/builtin-token
 
+          # Ensure jq is available (not present in devenv-c10s by default)
+          if ! command -v jq &>/dev/null; then
+            dnf install -y jq
+          fi
+
           echo "=== Token prefixes ==="
           echo -n "App token first 15 chars: "; head -c 15 /tmp/app-token; echo ""
           echo -n "Builtin token first 15 chars: "; head -c 15 /tmp/builtin-token; echo ""
