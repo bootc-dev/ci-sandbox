@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/bootc-dev/devenv-c10s:latest
-      options: --privileged
+      options: --privileged --user root
     steps:
       - uses: actions/create-github-app-token@v2
         id: app-token
