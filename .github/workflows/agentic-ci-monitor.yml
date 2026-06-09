@@ -66,15 +66,17 @@ jobs:
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
           mkdir -p ~/.config/opencode
-          jq -n '{
+          # Schema: https://opencode.ai/config.json
+          # Key is "provider" (singular), with options.apiKey and api URL.
+          jq -n --arg key "$MODELS_TOKEN" '{
             "$schema": "https://opencode.ai/config.json",
             "model": "openai/gpt-4.1",
             "autoupdate": false,
             "permission": "allow",
-            "providers": {
+            "provider": {
               "openai": {
-                "name": "GitHub Models",
                 "api": "https://models.github.ai/inference",
+                "options": {"apiKey": $key},
                 "models": {
                   "gpt-4.1": {
                     "id": "openai/gpt-4.1",
@@ -89,9 +91,8 @@ jobs:
               }
             }
           }' > ~/.config/opencode/config.json
-          echo "opencode config written"
-          # opencode reads the openai provider key from OPENAI_API_KEY
-          echo "OPENAI_API_KEY=${MODELS_TOKEN}" >> "$GITHUB_ENV"
+          echo "opencode config written:"
+          cat ~/.config/opencode/config.json
 
       # -----------------------------------------------------------------------
       # Collect CI failure data
