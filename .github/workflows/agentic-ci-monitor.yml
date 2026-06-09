@@ -84,6 +84,7 @@ jobs:
                 },
                 "models": {
                   "gpt-4.1": {
+                    "id": "openai/gpt-4.1",
                     "name": "GPT-4.1 via GitHub Models",
                     "attachment": true,
                     "reasoning": false,
