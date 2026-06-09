@@ -1,15 +1,13 @@
-# Agentic CI monitor: polls recent CI failures / merge queue and summarises them.
+# Agentic CI monitor: polls recent CI failures / merge queue and summarises
+# them using opencode via GitHub Models (models.github.ai).
 #
-# Auth strategy (in order of preference):
-#   1. GitHub Copilot via copilot_internal/v2/token exchange using the App token
-#      (ghs_... installation token) - works if bootc-dev org has Copilot Enterprise
-#   2. GitHub Copilot via GITHUB_TOKEN (also a ghs_... token) - same mechanism
-#   3. Raw data dump with no LLM summary if both fail
-#
-# The copilot exchange is tested at runtime; if it fails we fall through gracefully.
+# Auth: MODELS_TOKEN is a fine-grained PAT with organization_models:read on
+# bootc-dev. It's used as the API key for the github-models opencode provider
+# which talks to https://models.github.ai/inference (OpenAI-compatible API).
 #
 # Required secrets:
-#   APP_ID / APP_PRIVATE_KEY  - GitHub App with contents:write + pull-requests:write
+#   APP_ID / APP_PRIVATE_KEY  - GitHub App (contents:write + pull-requests:write)
+#   MODELS_TOKEN              - fine-grained PAT with organization_models:read
 
 name: Agentic CI Monitor
 
@@ -17,15 +15,19 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run: analyse and report, but do not commit or open a PR"
+        description: "Dry run: analyse only, do not commit or open a PR"
         required: false
         type: boolean
         default: true
       push_to_main:
-        description: "Commit directly to main instead of opening a PR (requires App token bypass)"
+        description: "Commit directly to main instead of opening a PR"
         required: false
         type: boolean
         default: false
+      extra_prompt:
+        description: "Extra instructions for the AI agent (optional)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -33,9 +35,6 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/bootc-dev/devenv-c10s:latest
-      options: --privileged
 
     steps:
       - name: Generate GitHub App token
@@ -56,45 +55,44 @@ jobs:
           git config user.name  "bootc-ci-bot[bot]"
           git config user.email "bootc-ci-bot[bot]@users.noreply.github.com"
 
-      # -----------------------------------------------------------------------
-      # Probe: can we exchange the App token (ghs_...) for a Copilot bearer?
-      # Also try the built-in GITHUB_TOKEN as a fallback.
-      # -----------------------------------------------------------------------
-      - name: Probe Copilot token exchange
-        id: copilot-probe
+      - name: Install opencode
+        run: npm install -g opencode-ai
+
+      # Configure opencode to use GitHub Models via a custom provider.
+      # models.github.ai exposes an OpenAI-compatible API; we point the
+      # built-in openai provider at it using MODELS_TOKEN as the key.
+      - name: Configure opencode for GitHub Models
         env:
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-          GH_TOKEN_BUILTIN: ${{ secrets.GITHUB_TOKEN }}
+          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
-          set -euo pipefail
-
-          HEADERS=(
-            -H "Accept: application/json"
-            -H "User-Agent: GitHubCopilotChat/0.35.0"
-            -H "Editor-Version: vscode/1.107.0"
-            -H "Editor-Plugin-Version: copilot-chat/0.35.0"
-            -H "Copilot-Integration-Id: vscode-chat"
-          )
-
-          try_exchange() {
-            local label=$1 token=$2
-            echo "--- trying $label (prefix: ${token:0:8}...) ---"
-            RESP=$(curl -s "${HEADERS[@]}" \
-              -H "Authorization: Bearer $token" \
-              https://api.github.com/copilot_internal/v2/token)
-            echo "$RESP" | jq '{token_preview: (.token // "NONE" | .[0:20]), error: .message}'
-            if echo "$RESP" | jq -e '.token' >/dev/null 2>&1; then
-              echo "copilot_token=$(echo "$RESP" | jq -r '.token')" >> "$GITHUB_OUTPUT"
-              echo "copilot_ok=true" >> "$GITHUB_OUTPUT"
-              echo "SUCCESS with $label"
-              return 0
-            fi
-            return 1
-          }
-
-          try_exchange "app-token" "$APP_TOKEN" \
-            || try_exchange "github-token" "$GH_TOKEN_BUILTIN" \
-            || { echo "copilot_ok=false" >> "$GITHUB_OUTPUT"; echo "Both tokens failed Copilot exchange"; }
+          mkdir -p ~/.config/opencode
+          cat > ~/.config/opencode/config.json << EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "model": "openai/gpt-4.1",
+  "autoupdate": false,
+  "permission": "allow",
+  "providers": {
+    "openai": {
+      "name": "GitHub Models",
+      "api": "https://models.github.ai/inference",
+      "models": {
+        "gpt-4.1": {
+          "id": "openai/gpt-4.1",
+          "name": "GPT-4.1 via GitHub Models",
+          "attachment": true,
+          "reasoning": false,
+          "tool_call": true,
+          "temperature": false,
+          "limit": { "context": 1048576, "output": 32768 }
+        }
+      }
+    }
+  }
+}
+EOF
+          # opencode reads provider API keys from env as OPENAI_API_KEY
+          echo "OPENAI_API_KEY=${MODELS_TOKEN}" >> "$GITHUB_ENV"
 
       # -----------------------------------------------------------------------
       # Collect CI failure data
@@ -127,70 +125,50 @@ jobs:
             | jq '.' > /tmp/merge-queue.json || echo '[]' > /tmp/merge-queue.json
 
       # -----------------------------------------------------------------------
-      # If Copilot exchange succeeded, use it directly via curl for a summary.
-      # This avoids needing opencode config entirely.
+      # Run opencode analysis
       # -----------------------------------------------------------------------
-      - name: Summarise with Copilot API
-        id: summarise
-        if: ${{ steps.copilot-probe.outputs.copilot_ok == 'true' }}
+      - name: Analyse with opencode
         env:
-          COPILOT_TOKEN: ${{ steps.copilot-probe.outputs.copilot_token }}
+          EXTRA: ${{ github.event.inputs.extra_prompt }}
         run: |
           set -euo pipefail
 
-          PAYLOAD=$(jq -n \
-            --argjson failed "$(cat /tmp/failed-runs.json)" \
-            --argjson prs "$(cat /tmp/open-prs.json)" \
-            --argjson mq "$(cat /tmp/merge-queue.json)" \
-            '{
-              model: "claude-sonnet-4-5",
-              messages: [{
-                role: "user",
-                content: ("You are a CI reliability engineer reviewing the bootc project.\n\n## Failed runs\n```json\n" + ($failed | tojson) + "\n```\n\n## Open PRs\n```json\n" + ($prs | tojson) + "\n```\n\n## Merge queue\n```json\n" + ($mq | tojson) + "\n```\n\nWrite a concise CI health report (<=500 words, plain markdown): summarise failure patterns, distinguish transient from regressions, name likely culprit commits/PRs, recommend one action per issue group.")
-              }],
-              max_tokens: 1024
-            }')
-
-          curl -s \
-            -H "Authorization: Bearer $COPILOT_TOKEN" \
-            -H "Content-Type: application/json" \
-            -H "User-Agent: GitHubCopilotChat/0.35.0" \
-            -H "Editor-Version: vscode/1.107.0" \
-            -H "Editor-Plugin-Version: copilot-chat/0.35.0" \
-            -H "Copilot-Integration-Id: vscode-chat" \
-            https://api.githubcopilot.com/chat/completions \
-            -d "$PAYLOAD" \
-            | tee /tmp/copilot-response.json \
-            | jq -r '.choices[0].message.content // ("ERROR: " + (.error.message // "unknown"))' \
-            > /tmp/ci-analysis.md
-
-          echo "=== Analysis ==="
-          cat /tmp/ci-analysis.md
-
-      # Fallback: plain data dump when Copilot is unavailable
-      - name: Generate plain data report (fallback)
-        if: ${{ steps.copilot-probe.outputs.copilot_ok != 'true' }}
-        run: |
           {
-            echo "# CI Report $(date -u +%Y-%m-%d)"
+            echo "You are a CI reliability engineer reviewing the bootc project."
             echo ""
-            echo "_(No LLM summary — Copilot token exchange failed)_"
-            echo ""
-            echo "## Failed runs"
+            echo "## Recent failed/cancelled runs on main"
             echo '```json'
             cat /tmp/failed-runs.json
             echo '```'
             echo ""
-            echo "## Open PRs"
+            echo "## Open pull requests"
             echo '```json'
             cat /tmp/open-prs.json
             echo '```'
             echo ""
-            echo "## Merge queue"
+            echo "## Merge queue groups"
             echo '```json'
             cat /tmp/merge-queue.json
             echo '```'
-          } > /tmp/ci-analysis.md
+            if [ -n "${EXTRA:-}" ]; then
+              echo ""
+              echo "## Additional context"
+              echo "$EXTRA"
+            fi
+            echo ""
+            echo "Write a concise CI health report (<=500 words, plain markdown):"
+            echo "1. Summarise failure patterns."
+            echo "2. Distinguish transient failures from probable regressions."
+            echo "3. Name likely culprit commits/PRs for any regression."
+            echo "4. Recommend one concrete next action per issue group."
+          } > /tmp/prompt.txt
+
+          opencode run \
+            --dangerously-skip-permissions \
+            "$(cat /tmp/prompt.txt)" \
+            > /tmp/ci-analysis.md
+
+          echo "=== Analysis ==="
           cat /tmp/ci-analysis.md
 
       - name: Upload CI analysis artifact
@@ -218,11 +196,11 @@ jobs:
 
 Generated by the agentic-ci-monitor workflow (push_to_main=true).
 
-Assisted-by: OpenCode (claude-sonnet-4-6)"
+Assisted-by: OpenCode (github-models/gpt-4.1)"
           git push origin main
 
       # -----------------------------------------------------------------------
-      # Open a PR (default path: dry_run=false, push_to_main=false)
+      # Open a PR (default: dry_run=false, push_to_main=false)
       # -----------------------------------------------------------------------
       - name: Open PR with analysis report
         if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.push_to_main != 'true' }}
@@ -241,7 +219,7 @@ Assisted-by: OpenCode (claude-sonnet-4-6)"
 
 Generated by the agentic-ci-monitor workflow.
 
-Assisted-by: OpenCode (claude-sonnet-4-6)"
+Assisted-by: OpenCode (github-models/gpt-4.1)"
           git push origin "$BRANCH"
           gh pr create \
             --repo "$REPO" \
