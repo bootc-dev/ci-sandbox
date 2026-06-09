@@ -202,6 +202,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          # opencode run's model response goes to the terminal, not stdout.
+          # We instruct the model to write its output to a file using the
+          # write tool, then verify the file exists after the run.
           {
             echo "You are a CI reliability engineer for the bootc project."
             echo "A CI run failed in the merge queue. Analyse the failure below."
@@ -224,15 +227,19 @@ jobs:
             echo "4. Recommend one concrete next action (re-run, specific fix,"
             echo "   or what to inspect next)."
             echo "Do not speculate beyond the evidence in the logs."
+            echo ""
+            echo "IMPORTANT: Write your analysis to the file /tmp/analysis.md using"
+            echo "the write tool. Do not just print it — write it to that file."
           } > /tmp/prompt.txt
 
           opencode run \
             --model github-models/gpt-4.1 \
+            --print-logs \
             --dangerously-skip-permissions \
-            "$(cat /tmp/prompt.txt)" > /tmp/analysis.md
+            "$(cat /tmp/prompt.txt)"
 
           if [ ! -s /tmp/analysis.md ]; then
-            echo "opencode produced no output" >&2; exit 1
+            echo "opencode did not write /tmp/analysis.md" >&2; exit 1
           fi
           echo "=== Analysis ==="
           cat /tmp/analysis.md
