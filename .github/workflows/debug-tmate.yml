@@ -66,11 +66,12 @@ jobs:
           echo "SSH: \`$SSH_URL\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Web: $WEB_URL" >> "$GITHUB_STEP_SUMMARY"
 
-          # Also post as a repo variable so it's queryable via API
-          gh api --method PATCH /repos/bootc-dev/ci-sandbox/actions/variables/TMATE_SSH_URL \
-            -f name=TMATE_SSH_URL -f value="$SSH_URL" 2>/dev/null || \
-          gh api --method POST /repos/bootc-dev/ci-sandbox/actions/variables \
-            -f name=TMATE_SSH_URL -f value="$SSH_URL" 2>/dev/null || true
+          # Post to a known issue as a comment so we can read it via API
+          # Post to issue #64 (tmate-ssh tracking issue) so URL is readable via API
+          gh issue comment 64 \
+            --repo bootc-dev/ci-sandbox \
+            --body "**tmate session ready** (run $GITHUB_RUN_ID): \`$SSH_URL\` / $WEB_URL" \
+            2>/dev/null || true
 
           echo "SSH: $SSH_URL"
           echo "Web: $WEB_URL"
