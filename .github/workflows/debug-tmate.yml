@@ -74,11 +74,12 @@ jobs:
         run: |
           # Install tmate if not present
           if ! command -v tmate &>/dev/null; then
-            if command -v dnf &>/dev/null; then
-              dnf install -y tmate
-            else
-              apt-get install -y tmate
-            fi
+            # tmate isn't in CentOS/RHEL repos - download the static binary
+            TMATE_VER=2.4.0
+            ARCH=$(uname -m)
+            curl -fsSL "https://github.com/tmate-io/tmate/releases/download/${TMATE_VER}/tmate-${TMATE_VER}-static-linux-${ARCH}.tar.xz" \
+              | tar -xJ --strip-components=1 -C /usr/local/bin tmate-${TMATE_VER}-static-linux-${ARCH}/tmate
+            chmod +x /usr/local/bin/tmate
           fi
 
           # Start the tmate session
