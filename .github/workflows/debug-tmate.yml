@@ -1,0 +1,107 @@
+# Interactive debug shell via tmate.
+# Drops into a shell inside the devenv-c10s container so we can poke at
+# the Copilot token exchange, opencode config, GitHub Models, etc. live.
+#
+# Usage: trigger via workflow_dispatch. The tmate SSH/web URL appears in
+# the "Start tmate session" step log. Connect and experiment.
+# The session stays open until you `touch /tmp/continue` or 30min elapses.
+
+name: Debug (tmate)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Where to run: devenv-c10s container or plain ubuntu"
+        required: false
+        type: choice
+        options:
+          - devenv-c10s
+          - plain-ubuntu
+        default: devenv-c10s
+
+permissions:
+  contents: read
+
+jobs:
+  debug-devenv:
+    if: ${{ inputs.runner == 'devenv-c10s' }}
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/bootc-dev/devenv-c10s:latest
+      options: --privileged
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Write tokens and print hints
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$APP_TOKEN"     > /tmp/app-token
+          echo "$BUILTIN_TOKEN" > /tmp/builtin-token
+          chmod 600 /tmp/app-token /tmp/builtin-token
+          cat <<'HINTS'
+          === Tokens written to /tmp/app-token (ghs_... App token) and /tmp/builtin-token (GITHUB_TOKEN) ===
+
+          # Copilot token exchange:
+          curl -s -H "Authorization: Bearer $(cat /tmp/app-token)" \
+            -H 'User-Agent: GitHubCopilotChat/0.35.0' \
+            -H 'Editor-Version: vscode/1.107.0' \
+            -H 'Editor-Plugin-Version: copilot-chat/0.35.0' \
+            -H 'Copilot-Integration-Id: vscode-chat' \
+            https://api.github.com/copilot_internal/v2/token | jq .
+
+          # GitHub Models inference:
+          curl -s -X POST -H "Authorization: Bearer $(cat /tmp/app-token)" \
+            -H 'Content-Type: application/json' \
+            https://models.github.ai/inference/chat/completions \
+            -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+
+          # opencode:
+          opencode --version
+          HINTS
+
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+          timeout-minutes: 30
+
+  debug-plain:
+    if: ${{ inputs.runner == 'plain-ubuntu' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Write tokens and print hints
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$APP_TOKEN"     > /tmp/app-token
+          echo "$BUILTIN_TOKEN" > /tmp/builtin-token
+          chmod 600 /tmp/app-token /tmp/builtin-token
+          echo "Tokens written. See devenv-c10s job hints for curl one-liners."
+
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+          timeout-minutes: 30
