@@ -1,0 +1,277 @@
+# Agentic merge-queue monitor: when the CI workflow fails on a merge-queue run,
+# analyse the failure with opencode (via GitHub Models gpt-4.1) and post a
+# debugging comment on the originating PR.
+#
+# Trigger: workflow_run fires after CI completes with conclusion, head_branch,
+# and head_sha available — unlike merge_group which fires at queue entry start
+# and carries no failure info.
+#
+# Auth:
+#   APP_ID / APP_PRIVATE_KEY  - GitHub App: contents:write, pull-requests:write
+#   MODELS_TOKEN              - fine-grained PAT with models:read
+
+name: Agentic Merge Queue Monitor
+
+on:
+  workflow_run:
+    # Must match the `name:` field in .github/workflows/ci.yml exactly.
+    workflows: ["CI"]
+    types: [completed]
+
+# workflow_run always runs from the default branch. All writes go through the
+# App token; the workflow's own GITHUB_TOKEN stays minimal.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  # One analysis per failed run; never cancel an in-flight analysis.
+  group: mq-monitor-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    # Only act on actual failures; timed-out/cancelled runs are rarely
+    # actionable as code regressions.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      # -----------------------------------------------------------------------
+      # Resolve the PR number from the failed run's head branch / SHA.
+      # Merge-queue branches look like: gh-readonly-queue/main/pr-NNN-<sha>
+      # -----------------------------------------------------------------------
+      - name: Resolve target PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          pr=""
+
+          if [[ "$HEAD_BRANCH" =~ pr-([0-9]+) ]]; then
+            pr="${BASH_REMATCH[1]}"
+            echo "Parsed PR #$pr from branch '$HEAD_BRANCH'"
+          fi
+
+          # Fallback: find a PR associated with the failing commit SHA.
+          if [ -z "$pr" ]; then
+            pr=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+                   --jq 'sort_by(.updated_at) | reverse | .[0].number' \
+                   2>/dev/null || true)
+            [ "$pr" = "null" ] && pr=""
+            [ -n "$pr" ] && echo "Resolved PR #$pr via commit SHA $HEAD_SHA"
+          fi
+
+          if [ -z "$pr" ]; then
+            echo "No PR associated with this failure; nothing to comment on."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "found=true"  >> "$GITHUB_OUTPUT"
+          echo "number=$pr"  >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Deduplicate: skip if we already commented for this exact run.
+      # Keyed on run id so a PR that fails twice in different queue batches
+      # gets one comment per failure.
+      # -----------------------------------------------------------------------
+      - name: Check for existing analysis comment
+        id: dedup
+        if: ${{ steps.pr.outputs.found == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- mq-monitor:run-${RUN_ID} -->"
+          if gh api "repos/$REPO/issues/$PR/comments" --paginate \
+               --jq '.[].body' | grep -qF "$marker"; then
+            echo "Already analysed run $RUN_ID for PR #$PR; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Fetch just the failed-step logs; keep the tail (errors are at the end).
+      # -----------------------------------------------------------------------
+      - name: Collect failure logs
+        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          gh run view "$RUN_ID" --repo "$REPO" \
+            --json displayTitle,headBranch,headSha,event,jobs \
+            --jq '{
+              title: .displayTitle,
+              branch: .headBranch,
+              sha: .headSha,
+              event: .event,
+              failed_jobs: [.jobs[]
+                | select(.conclusion == "failure")
+                | {name, url, steps: [.steps[]
+                    | select(.conclusion == "failure")
+                    | {name, number}]}]
+            }' > /tmp/run-meta.json
+
+          gh run view "$RUN_ID" --repo "$REPO" --log-failed \
+            > /tmp/failed-log-full.txt 2>/dev/null || true
+
+          # Truncate to ~50KB — errors are almost always at the tail.
+          if [ -s /tmp/failed-log-full.txt ]; then
+            tail -c 50000 /tmp/failed-log-full.txt > /tmp/failed-log.txt
+          else
+            echo "(no failed-step logs available)" > /tmp/failed-log.txt
+          fi
+
+      - name: Install opencode
+        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
+        run: npm install -g opencode-ai
+
+      # Uses @ai-sdk/openai-compatible (chat/completions) — the built-in openai
+      # provider uses /responses which GitHub Models does not support.
+      - name: Configure opencode for GitHub Models
+        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
+        env:
+          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
+        run: |
+          echo "OPENCODE_CONFIG_CONTENT=$(jq -cn --arg key "$MODELS_TOKEN" '{
+            "$schema": "https://opencode.ai/config.json",
+            "model": "github-models/gpt-4.1",
+            "autoupdate": false,
+            "permission": "allow",
+            "agent": {
+              "compaction": {"model": "github-models/gpt-4.1-mini"},
+              "title":      {"model": "github-models/gpt-4.1-mini"},
+              "summary":    {"model": "github-models/gpt-4.1-mini"}
+            },
+            "provider": {
+              "github-models": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "GitHub Models",
+                "options": {
+                  "baseURL": "https://models.github.ai/inference/v1",
+                  "apiKey": $key
+                },
+                "models": {
+                  "gpt-4.1": {
+                    "id": "openai/gpt-4.1",
+                    "name": "GPT-4.1",
+                    "attachment": true, "reasoning": false, "tool_call": true,
+                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
+                  },
+                  "gpt-4.1-mini": {
+                    "id": "openai/gpt-4.1-mini",
+                    "name": "GPT-4.1-mini",
+                    "attachment": true, "reasoning": false, "tool_call": true,
+                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
+                  }
+                }
+              }
+            }
+          }')" >> "$GITHUB_ENV"
+
+      # -----------------------------------------------------------------------
+      # Build prompt and run the analysis (single LLM call).
+      # -----------------------------------------------------------------------
+      - name: Analyse failure with opencode
+        id: analyze
+        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
+        timeout-minutes: 5
+        env:
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "You are a CI reliability engineer for the bootc project."
+            echo "A CI run failed in the merge queue. Analyse the failure below."
+            echo ""
+            echo "## Failed run metadata"
+            echo '```json'
+            cat /tmp/run-meta.json
+            echo '```'
+            echo ""
+            echo "## Failed-step logs (tail, truncated to 50KB)"
+            echo '```text'
+            cat /tmp/failed-log.txt
+            echo '```'
+            echo ""
+            echo "Write a concise analysis (<=250 words, plain markdown, no top-level heading):"
+            echo "1. Name the specific failing job/step and the key error line."
+            echo "2. State whether this looks like a flaky/transient failure or a"
+            echo "   genuine regression, and why."
+            echo "3. Give the most likely root cause."
+            echo "4. Recommend one concrete next action (re-run, specific fix,"
+            echo "   or what to inspect next)."
+            echo "Do not speculate beyond the evidence in the logs."
+          } > /tmp/prompt.txt
+
+          opencode run \
+            --model github-models/gpt-4.1 \
+            --dangerously-skip-permissions \
+            "$(cat /tmp/prompt.txt)" > /tmp/analysis.md
+
+          if [ ! -s /tmp/analysis.md ]; then
+            echo "opencode produced no output" >&2; exit 1
+          fi
+          echo "=== Analysis ==="
+          cat /tmp/analysis.md
+
+      - name: Upload analysis artifact
+        if: ${{ always() && steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v5
+        with:
+          name: mq-analysis-${{ steps.pr.outputs.number }}
+          path: |
+            /tmp/analysis.md
+            /tmp/run-meta.json
+            /tmp/failed-log.txt
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Post the debugging comment on the PR.
+      # -----------------------------------------------------------------------
+      - name: Post analysis comment on PR
+        if: ${{ steps.pr.outputs.found == 'true' && steps.dedup.outputs.skip != 'true' && steps.analyze.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.number }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## 🤖 CI Failure Analysis"
+            echo ""
+            echo "Merge-queue CI run **failed** for commit \`${HEAD_SHA:0:8}\` — [view run]($RUN_URL)."
+            echo ""
+            cat /tmp/analysis.md
+            echo ""
+            echo "---"
+            echo "_AI-generated by the [agentic-merge-queue-monitor](.github/workflows/agentic-merge-queue-monitor.yml) workflow using GitHub Models (gpt-4.1). Treat as a starting point, not ground truth._"
+            echo "<!-- mq-monitor:run-${RUN_ID} -->"
+          } > /tmp/comment.md
+
+          gh pr comment "$PR" --repo "$REPO" --body-file /tmp/comment.md
