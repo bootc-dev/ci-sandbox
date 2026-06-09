@@ -108,6 +108,16 @@ jobs:
             echo "**Web:** ${WEB_URL}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # Post the tmate URL as an issue comment so it's readable via REST API
+          # while the job is still in progress (step summaries aren't visible until job end)
+          APP_TOKEN=$(cat /tmp/app-token)
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -s -X POST \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/59/comments" \
+            -d "{\"body\": \"## tmate session for run [${GITHUB_RUN_ID}](${RUN_URL})\n\n**SSH:** \`${SSH_URL}\`\n\n**Web:** ${WEB_URL}\n\nRun \`touch /tmp/continue\` to let the workflow finish.\"}"
+
           # Wait for /tmp/continue or 30 min timeout
           DEADLINE=$(($(date +%s) + 1800))
           while [ ! -f /tmp/continue ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do
