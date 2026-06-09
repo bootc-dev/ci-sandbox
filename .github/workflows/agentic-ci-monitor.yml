@@ -60,20 +60,24 @@ jobs:
       - name: Install opencode
         run: npm install -g opencode-ai
 
-      # Configure opencode to use GitHub Models via a custom provider.
-      # The built-in "openai" provider uses the Responses API (/responses),
-      # which GitHub Models does not support. Instead we use the
-      # @ai-sdk/openai-compatible npm package which uses /chat/completions.
+      # Configure opencode via OPENCODE_CONFIG_CONTENT env var — avoids file
+      # precedence issues. Uses @ai-sdk/openai-compatible (chat/completions)
+      # since the built-in openai provider uses /responses which GitHub Models
+      # does not support. Main model: gpt-4o; sub-tasks: gpt-4o-mini.
       - name: Configure opencode for GitHub Models
         env:
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
-          mkdir -p ~/.config/opencode
-          jq -n --arg key "$MODELS_TOKEN" '{
+          echo "OPENCODE_CONFIG_CONTENT=$(jq -cn --arg key "$MODELS_TOKEN" '{
             "$schema": "https://opencode.ai/config.json",
             "model": "github-models/gpt-4.1",
             "autoupdate": false,
             "permission": "allow",
+            "agent": {
+              "compaction": {"model": "github-models/gpt-4.1-mini"},
+              "title":      {"model": "github-models/gpt-4.1-mini"},
+              "summary":    {"model": "github-models/gpt-4.1-mini"}
+            },
             "provider": {
               "github-models": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -85,19 +89,20 @@ jobs:
                 "models": {
                   "gpt-4.1": {
                     "id": "openai/gpt-4.1",
-                    "name": "GPT-4.1 via GitHub Models",
-                    "attachment": true,
-                    "reasoning": false,
-                    "tool_call": true,
-                    "temperature": false,
-                    "limit": {"context": 1048576, "output": 32768}
+                    "name": "GPT-4.1",
+                    "attachment": true, "reasoning": false, "tool_call": true,
+                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
+                  },
+                  "gpt-4.1-mini": {
+                    "id": "openai/gpt-4.1-mini",
+                    "name": "GPT-4.1-mini",
+                    "attachment": true, "reasoning": false, "tool_call": true,
+                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
                   }
                 }
               }
             }
-          }' > ~/.config/opencode/config.json
-          echo "opencode config written:"
-          cat ~/.config/opencode/config.json
+          }')" >> "$GITHUB_ENV"
 
       # -----------------------------------------------------------------------
       # Collect CI failure data

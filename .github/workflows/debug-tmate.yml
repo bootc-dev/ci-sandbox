@@ -27,40 +27,41 @@ jobs:
       - name: Install opencode
         run: npm install -g opencode-ai
 
-      - name: Write tokens
+      - name: Test curl to GitHub Models directly
         env:
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
-          echo "$MODELS_TOKEN" > /tmp/models-token
-          chmod 600 /tmp/models-token
-          echo -n "models-token prefix: "; head -c 15 /tmp/models-token; echo
-
-      - name: Test curl to GitHub Models directly
-        run: |
           echo "## Direct curl test" >> "$GITHUB_STEP_SUMMARY"
           RESULT=$(curl -s --max-time 15 -X POST \
-            -H "Authorization: Bearer $(cat /tmp/models-token)" \
+            -H "Authorization: Bearer $MODELS_TOKEN" \
             -H "Content-Type: application/json" \
             https://models.github.ai/inference/chat/completions \
-            -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"say hello in 3 words"}],"max_tokens":10}')
+            -d '{"model":"openai/gpt-4.1","messages":[{"role":"user","content":"say hello in 3 words"}],"max_tokens":10}')
           echo "$RESULT" | jq .
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "$RESULT" | jq . >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Write opencode config
+      - name: Test opencode run (90s timeout)
         env:
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
-          mkdir -p ~/.config/opencode
-          # Use @ai-sdk/openai-compatible (chat/completions API) not built-in openai
-          # provider (which uses /responses — not supported by GitHub Models).
-          # The baseURL must end in /v1 for the SDK to append /chat/completions correctly.
-          jq -n --arg key "$MODELS_TOKEN" '{
+          # Use OPENCODE_CONFIG_CONTENT to inject config as env var — avoids
+          # any file precedence issues and works cleanly on a fresh runner.
+          # Main model: gpt-4o (solid, free-tier GitHub Models).
+          # Sub-tasks (title/compaction/summary): gpt-4o-mini.
+          # Uses @ai-sdk/openai-compatible (chat/completions) not the built-in
+          # openai provider (which uses /responses, unsupported by GitHub Models).
+          export OPENCODE_CONFIG_CONTENT=$(jq -cn --arg key "$MODELS_TOKEN" '{
             "$schema": "https://opencode.ai/config.json",
             "model": "github-models/gpt-4.1",
             "autoupdate": false,
             "permission": "allow",
+            "agent": {
+              "compaction": {"model": "github-models/gpt-4.1-mini"},
+              "title":      {"model": "github-models/gpt-4.1-mini"},
+              "summary":    {"model": "github-models/gpt-4.1-mini"}
+            },
             "provider": {
               "github-models": {
                 "npm": "@ai-sdk/openai-compatible",
@@ -72,24 +73,24 @@ jobs:
                 "models": {
                   "gpt-4.1": {
                     "id": "openai/gpt-4.1",
-                    "name": "GPT-4.1 (GitHub Models)",
-                    "attachment": true,
-                    "reasoning": false,
-                    "tool_call": true,
-                    "temperature": false,
-                    "limit": {"context": 1048576, "output": 32768}
+                    "name": "GPT-4.1",
+                    "attachment": true, "reasoning": false, "tool_call": true,
+                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
+                  },
+                  "gpt-4.1-mini": {
+                    "id": "openai/gpt-4.1-mini",
+                    "name": "GPT-4.1-mini",
+                    "attachment": true, "reasoning": false, "tool_call": true,
+                    "temperature": false, "limit": {"context": 1047576, "output": 32768}
                   }
                 }
               }
             }
-          }' > ~/.config/opencode/config.json
-          echo "Config:"
-          cat ~/.config/opencode/config.json
+          }')
 
-      - name: Test opencode run (90s timeout)
-        run: |
           echo "## opencode output" >> "$GITHUB_STEP_SUMMARY"
           RESULT=$(timeout 90 opencode run \
+            --model github-models/gpt-4.1 \
             --print-logs \
             --dangerously-skip-permissions \
             "say hello in exactly 3 words, nothing else" 2>&1) || true
