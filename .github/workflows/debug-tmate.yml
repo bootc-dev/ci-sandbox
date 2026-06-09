@@ -1,8 +1,8 @@
-# Interactive debug shell via tmate, running inside the properly-initialized
-# devenv-c10s devcontainer (postCreateCommand fires, userns-setup runs, etc.)
+# Interactive debug shell via tmate for live experimentation with
+# Copilot/Models APIs and GHA token capabilities.
 #
-# Uses devcontainers/ci to spin up the container the same way Codespaces does,
-# then drops into a tmate session for live experimentation.
+# Runs on plain ubuntu-24.04 — no devcontainer init issues.
+# opencode is installed fresh via npm in the setup step.
 
 name: Debug (tmate)
 
@@ -29,7 +29,12 @@ jobs:
         with:
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Write tokens for use inside the container
+      - name: Install tools
+        run: |
+          sudo apt-get install -y jq curl
+          npm install -g opencode-ai opencode-copilot-auth
+
+      - name: Write tokens
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,53 +42,11 @@ jobs:
           echo "$APP_TOKEN"     > /tmp/app-token
           echo "$BUILTIN_TOKEN" > /tmp/builtin-token
           chmod 600 /tmp/app-token /tmp/builtin-token
+          echo -n "app-token prefix:     "; head -c 12 /tmp/app-token; echo
+          echo -n "builtin-token prefix: "; head -c 12 /tmp/builtin-token; echo
 
-      - name: Start tmate session inside devcontainer
-        uses: devcontainers/ci@v0.3
+      - name: Start tmate session
+        uses: mxschmitt/action-tmate@v3
         with:
-          runCmd: |
-            # Install tmate inside the container
-            if ! command -v tmate &>/dev/null; then
-              curl -Lo /tmp/tmate.tar.xz https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz
-              tar -xf /tmp/tmate.tar.xz -C /tmp
-              sudo mv /tmp/tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/tmate
-            fi
-
-            echo "=== Token prefixes ==="
-            echo -n "app-token:     "; head -c 12 /tmp/app-token; echo
-            echo -n "builtin-token: "; head -c 12 /tmp/builtin-token; echo
-
-            echo ""
-            echo "=== Useful one-liners ==="
-            cat <<'HINTS'
-            # Copilot token exchange:
-            curl -s -H "Authorization: Bearer $(cat /tmp/app-token)" \
-              -H 'User-Agent: GitHubCopilotChat/0.35.0' \
-              -H 'Editor-Version: vscode/1.107.0' \
-              -H 'Editor-Plugin-Version: copilot-chat/0.35.0' \
-              -H 'Copilot-Integration-Id: vscode-chat' \
-              https://api.github.com/copilot_internal/v2/token | jq .
-
-            # GitHub Models:
-            curl -s -X POST -H "Authorization: Bearer $(cat /tmp/app-token)" \
-              -H 'Content-Type: application/json' \
-              https://models.github.ai/inference/chat/completions \
-              -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"hello"}],"max_tokens":10}' | jq .
-
-            # opencode version + providers:
-            opencode --version
-            HINTS
-
-            # Start tmate and print connection info
-            tmate -S /tmp/tmate.sock new-session -d
-            tmate -S /tmp/tmate.sock wait tmate-ready
-            echo ""
-            echo "=== TMATE SESSION ==="
-            tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
-            tmate -S /tmp/tmate.sock display -p '#{tmate_web}'
-            echo "====================="
-
-            # Wait until the user signals done or 25 minutes pass
-            echo "Session open. Touch /tmp/continue to exit."
-            timeout 1500 bash -c 'until [ -f /tmp/continue ]; do sleep 5; done' || true
-            echo "Session ended."
+          limit-access-to-actor: true
+          timeout-minutes: 30
