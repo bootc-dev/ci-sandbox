@@ -1,0 +1,199 @@
+# Agentic CI monitor: polls merge queue / recent CI failures and opens a PR
+# with a summary report.
+#
+# Design notes:
+#   - Runs inside ghcr.io/bootc-dev/devenv-c10s (the c10s devenv from
+#     https://github.com/bootc-dev/infra) which already ships opencode-ai
+#     and the gh CLI.
+#   - Uses the repo's existing GitHub App token (APP_ID / APP_PRIVATE_KEY,
+#     also used by scheduled-release.yml) so PRs are attributed to the bot
+#     and the token can be granted bypass-branch-protection if desired.
+#   - Force-pushing to main is NOT done here: GITHUB_TOKEN cannot bypass
+#     branch protection, and while a GitHub App token CAN be granted that
+#     privilege, doing so requires explicit admin configuration and should be
+#     a separate, deliberate step.  The workflow therefore always goes via a
+#     PR, which is auditable and safe.
+#
+# Required secrets:
+#   APP_ID / APP_PRIVATE_KEY  - GitHub App with contents:write + pull-requests:write
+#   OPENCODE_API_KEY          - API key forwarded to opencode (Anthropic / OpenAI)
+
+name: Agentic CI Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: analyse and report, but do not open a PR"
+        required: false
+        type: boolean
+        default: true
+      extra_prompt:
+        description: "Extra instructions for the AI agent (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-24.04
+    # The c10s devenv image (built from bootc-dev/infra) ships:
+    #   opencode-ai (npm), gh CLI, goose, jj, nu, just, podman, Rust, Go, etc.
+    container:
+      image: ghcr.io/bootc-dev/devenv-c10s:latest
+      options: --privileged  # needed for rootless podman inside the image
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "bootc-ci-bot[bot]"
+          git config user.email "bootc-ci-bot[bot]@users.noreply.github.com"
+
+      # -----------------------------------------------------------------------
+      # Collect recent CI failures and merge-queue state
+      # -----------------------------------------------------------------------
+      - name: Collect recent CI failures
+        id: collect
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Last 20 workflow runs on main that failed or were cancelled
+          gh run list \
+            --repo "$REPO" \
+            --branch main \
+            --limit 20 \
+            --json databaseId,name,status,conclusion,createdAt,headSha,headBranch,url \
+            --jq '[.[] | select(.conclusion == "failure" or .conclusion == "cancelled")]' \
+            > /tmp/failed-runs.json
+
+          echo "=== Failed/cancelled runs (last 20 on main) ==="
+          jq -r '.[] | "  \(.createdAt)  \(.name)  \(.conclusion)  sha=\(.headSha[0:8])  \(.url)"' \
+            /tmp/failed-runs.json || true
+
+          # Open PRs and their merge state
+          gh api "repos/$REPO/pulls?state=open&per_page=20" \
+            --jq '[.[] | {number, title, draft, mergeable_state, labels: [.labels[].name], url: .html_url}]' \
+            > /tmp/open-prs.json
+          echo "=== Open PRs ==="
+          jq -r '.[] | "  #\(.number) [\(.mergeable_state)] \(.title)"' /tmp/open-prs.json || true
+
+          # Merge queue entries (if any)
+          gh api "repos/$REPO/merge-queue/groups" 2>/dev/null \
+            | jq '.' > /tmp/merge-queue.json || echo '[]' > /tmp/merge-queue.json
+
+      # -----------------------------------------------------------------------
+      # Analyse with opencode
+      # opencode run writes its final response to stdout; we capture it.
+      # -----------------------------------------------------------------------
+      - name: Analyse with opencode
+        id: analysis
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          EXTRA: ${{ github.event.inputs.extra_prompt }}
+        run: |
+          set -euo pipefail
+
+          FAILED=$(cat /tmp/failed-runs.json)
+          PRS=$(cat /tmp/open-prs.json)
+          MQ=$(cat /tmp/merge-queue.json)
+
+          MESSAGE="You are a CI reliability engineer reviewing the bootc project.
+
+          ## Recent failed/cancelled runs on main
+          \`\`\`json
+          $FAILED
+          \`\`\`
+
+          ## Open pull requests (merge state)
+          \`\`\`json
+          $PRS
+          \`\`\`
+
+          ## Merge queue groups
+          \`\`\`json
+          $MQ
+          \`\`\`
+
+          ${EXTRA:+Additional context: $EXTRA}
+
+          Please write a concise report (≤500 words, plain markdown) that:
+          1. Summarises the failure patterns.
+          2. Distinguishes transient failures (runner flakes, network, rate-limits) from probable code regressions.
+          3. If any regression looks likely, names the probable commit or PR.
+          4. Recommends one concrete next action per issue group."
+
+          opencode run \
+            --dangerously-skip-permissions \
+            "$MESSAGE" \
+            > /tmp/ci-analysis.md
+
+          echo "=== Analysis output ==="
+          cat /tmp/ci-analysis.md
+
+      # -----------------------------------------------------------------------
+      # Upload the analysis as a workflow artifact (always, even on dry run)
+      # -----------------------------------------------------------------------
+      - name: Upload CI analysis artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ci-analysis
+          path: /tmp/ci-analysis.md
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Open a PR that records the analysis in docs/ci-reports/
+      # Skipped in dry-run mode (default: true).
+      # -----------------------------------------------------------------------
+      - name: Open PR with analysis report
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          DATE=$(date -u +%Y-%m-%d)
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          BRANCH="ci-analysis/${TS}"
+
+          git checkout -b "$BRANCH"
+
+          mkdir -p docs/ci-reports
+          REPORT="docs/ci-reports/${DATE}-ci-analysis.md"
+          cp /tmp/ci-analysis.md "$REPORT"
+
+          git add "$REPORT"
+          git commit -m "ci: Add automated CI failure analysis ${DATE}
+
+          Generated by the agentic-ci-monitor workflow.
+
+          Assisted-by: OpenCode (claude-sonnet-4-6)"
+
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --repo "$REPO" \
+            --base main \
+            --head "$BRANCH" \
+            --title "ci: Automated CI failure analysis ${DATE}" \
+            --body "$(printf '%s\n\n---\n_Generated by the [agentic-ci-monitor](.github/workflows/agentic-ci-monitor.yml) workflow._' "$(cat /tmp/ci-analysis.md)")"
