@@ -1,8 +1,5 @@
-# Interactive debug shell via tmate for live experimentation with
-# Copilot/Models APIs and GHA token capabilities.
-#
-# Runs on plain ubuntu-24.04 — no devcontainer init issues.
-# opencode is installed fresh via npm in the setup step.
+# Quick opencode + GitHub Models probe — no tmate, just runs the test
+# and posts results to the step summary (readable after completion).
 
 name: Debug (tmate)
 
@@ -17,63 +14,79 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Generate GitHub App token
+      - uses: actions/create-github-app-token@v2
         id: app-token
-        uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Install tools
-        run: |
-          sudo apt-get install -y jq curl
-          npm install -g opencode-ai opencode-copilot-auth
+      - name: Install opencode
+        run: npm install -g opencode-ai
 
       - name: Write tokens
         env:
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-          BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
-          echo "$APP_TOKEN"     > /tmp/app-token
-          echo "$BUILTIN_TOKEN" > /tmp/builtin-token
-          echo "$MODELS_TOKEN"  > /tmp/models-token
-          chmod 600 /tmp/app-token /tmp/builtin-token /tmp/models-token
-          echo -n "app-token prefix:    "; head -c 12 /tmp/app-token; echo
-          echo -n "builtin-token prefix:"; head -c 12 /tmp/builtin-token; echo
-          echo -n "models-token prefix: "; head -c 12 /tmp/models-token; echo
+          echo "$MODELS_TOKEN" > /tmp/models-token
+          chmod 600 /tmp/models-token
+          echo -n "models-token prefix: "; head -c 15 /tmp/models-token; echo
 
-      # Start tmate in detached mode, grab the SSH URL, post it to the
-      # step summary (readable via gh run view --log after the step starts),
-      # then block until /tmp/continue is touched or 30min elapses.
-      - name: Start tmate session
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      - name: Test curl to GitHub Models directly
         run: |
-          curl -fsSL https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz \
-            | tar -xJ --strip-components=1 -C /usr/local/bin tmate-2.4.0-static-linux-amd64/tmate
-          tmate -S /tmp/tmate.sock new-session -d
-          tmate -S /tmp/tmate.sock wait tmate-ready
-          SSH_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          WEB_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          echo "## Direct curl test" >> "$GITHUB_STEP_SUMMARY"
+          RESULT=$(curl -s --max-time 15 -X POST \
+            -H "Authorization: Bearer $(cat /tmp/models-token)" \
+            -H "Content-Type: application/json" \
+            https://models.github.ai/inference/chat/completions \
+            -d '{"model":"openai/gpt-4.1-nano","messages":[{"role":"user","content":"say hello in 3 words"}],"max_tokens":10}')
+          echo "$RESULT" | jq .
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$RESULT" | jq . >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-          echo "## Tmate session" >> "$GITHUB_STEP_SUMMARY"
-          echo "SSH: \`$SSH_URL\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Web: $WEB_URL" >> "$GITHUB_STEP_SUMMARY"
+      - name: Write opencode config
+        env:
+          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
+        run: |
+          mkdir -p ~/.config/opencode
+          jq -n --arg key "$MODELS_TOKEN" '{
+            "$schema": "https://opencode.ai/config.json",
+            "model": "openai/gpt-4.1",
+            "autoupdate": false,
+            "permission": "allow",
+            "provider": {
+              "openai": {
+                "api": "https://models.github.ai/inference",
+                "options": {"apiKey": $key},
+                "models": {
+                  "gpt-4.1": {
+                    "id": "openai/gpt-4.1",
+                    "name": "GPT-4.1 (GitHub Models)",
+                    "attachment": true,
+                    "reasoning": false,
+                    "tool_call": true,
+                    "temperature": false,
+                    "limit": {"context": 1048576, "output": 32768}
+                  }
+                }
+              }
+            }
+          }' > ~/.config/opencode/config.json
+          echo "Config:"
+          cat ~/.config/opencode/config.json
 
-          # Post to a known issue as a comment so we can read it via API
-          # Post to issue #64 (tmate-ssh tracking issue) so URL is readable via API
-          gh issue comment 64 \
-            --repo bootc-dev/ci-sandbox \
-            --body "**tmate session ready** (run $GITHUB_RUN_ID): \`$SSH_URL\` / $WEB_URL" \
-            2>/dev/null || true
-
-          echo "SSH: $SSH_URL"
-          echo "Web: $WEB_URL"
-          echo "Waiting for /tmp/continue or 30 minutes..."
-          timeout 1800 bash -c 'until [ -f /tmp/continue ]; do sleep 5; done' || true
+      - name: Test opencode run (60s timeout)
+        run: |
+          echo "## opencode output" >> "$GITHUB_STEP_SUMMARY"
+          RESULT=$(timeout 60 opencode run \
+            --print-logs \
+            --dangerously-skip-permissions \
+            "say hello in exactly 3 words, nothing else" 2>&1) || true
+          echo "$RESULT"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$RESULT" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
