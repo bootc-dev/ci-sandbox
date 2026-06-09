@@ -76,9 +76,13 @@ jobs:
           if ! command -v tmate &>/dev/null; then
             # tmate isn't in CentOS/RHEL repos - download the static binary
             TMATE_VER=2.4.0
-            ARCH=$(uname -m)
-            curl -fsSL "https://github.com/tmate-io/tmate/releases/download/${TMATE_VER}/tmate-${TMATE_VER}-static-linux-${ARCH}.tar.xz" \
-              | tar -xJ --strip-components=1 -C /usr/local/bin tmate-${TMATE_VER}-static-linux-${ARCH}/tmate
+            case "$(uname -m)" in
+              x86_64)  TMATE_ARCH=amd64 ;;
+              aarch64) TMATE_ARCH=arm64v8 ;;
+              *)       TMATE_ARCH=$(uname -m) ;;
+            esac
+            curl -fsSL "https://github.com/tmate-io/tmate/releases/download/${TMATE_VER}/tmate-${TMATE_VER}-static-linux-${TMATE_ARCH}.tar.xz" \
+              | tar -xJ --strip-components=1 -C /usr/local/bin "tmate-${TMATE_VER}-static-linux-${TMATE_ARCH}/tmate"
             chmod +x /usr/local/bin/tmate
           fi
 
