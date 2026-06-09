@@ -38,12 +38,15 @@ jobs:
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           BUILTIN_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODELS_TOKEN: ${{ secrets.MODELS_TOKEN }}
         run: |
           echo "$APP_TOKEN"     > /tmp/app-token
           echo "$BUILTIN_TOKEN" > /tmp/builtin-token
-          chmod 600 /tmp/app-token /tmp/builtin-token
-          echo -n "app-token prefix:     "; head -c 12 /tmp/app-token; echo
-          echo -n "builtin-token prefix: "; head -c 12 /tmp/builtin-token; echo
+          echo "$MODELS_TOKEN"  > /tmp/models-token
+          chmod 600 /tmp/app-token /tmp/builtin-token /tmp/models-token
+          echo -n "app-token prefix:    "; head -c 12 /tmp/app-token; echo
+          echo -n "builtin-token prefix:"; head -c 12 /tmp/builtin-token; echo
+          echo -n "models-token prefix: "; head -c 12 /tmp/models-token; echo
 
       - name: Start tmate session
         uses: mxschmitt/action-tmate@v3
