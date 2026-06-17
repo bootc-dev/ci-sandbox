@@ -1,4 +1,6 @@
 # merge-queue-like-bors
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fbootc-dev%2Fci-sandbox.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fbootc-dev%2Fci-sandbox?ref=badge_shield)
+
 
 A demonstration of running GitHub's merge queue like [bors](https://github.com/rust-lang/bors): expensive CI only runs once, on the tip of the queue batch.
 
@@ -94,3 +96,6 @@ annotated example. The critical section is the `merge_group` branch of
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fbootc-dev%2Fci-sandbox.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fbootc-dev%2Fci-sandbox?ref=badge_large)
