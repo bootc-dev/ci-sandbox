@@ -1,0 +1,63 @@
+name: Probe cncf-ubuntu-8-32-x86 toolchain
+
+# One-off probe related to bootc-dev/bootc CI jobs failing with
+# "cargo: not found" / "sh: 1: cargo: not found" after switching several
+# jobs from `runs-on: ubuntu-24.04` (GitHub-hosted) to
+# `runs-on: cncf-ubuntu-8-32-x86` (CNCF-sponsored actions-runner-controller
+# runners on Oracle Cloud, using the custom ghcr.io/cncf/gha-cloudrunner
+# image rather than a genuine actions/runner-images build).
+#
+# This dumps OS/toolchain info from the runner so we can confirm whether
+# Rust/cargo (and a few other common build tools) are actually missing, and
+# get a general sense of how minimal the image is compared to a standard
+# GitHub-hosted runner.
+#
+# Safe to delete once the investigation is resolved.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: cncf-ubuntu-8-32-x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dump OS/toolchain info
+        run: |
+          set +e
+
+          echo "### /etc/os-release ###"
+          cat /etc/os-release
+
+          echo "### uname/nproc/free/df ###"
+          uname -a
+          nproc
+          free -h
+          df -h /
+
+          echo "### which cargo rustc rustup git podman buildah skopeo just gcc ###"
+          for tool in cargo rustc rustup git podman buildah skopeo just gcc; do
+            which "$tool" || echo "$tool: not found"
+          done
+
+          echo "### PATH ###"
+          echo "PATH=$PATH"
+
+          echo "### common rust install locations ###"
+          ls -la /root/.cargo/bin /home/*/.cargo/bin /usr/local/cargo/bin /usr/local/rustup 2>&1
+
+          echo "### dpkg rust/cargo packages ###"
+          dpkg -l | grep -iE 'rust|cargo' || echo "no rust/cargo debs installed"
+
+          echo "### installed package count ###"
+          apt list --installed 2>/dev/null | wc -l
+
+          echo "### /usr/bin and /usr/local/bin richness ###"
+          ls /usr/bin | wc -l
+          ls /usr/local/bin | wc -l
