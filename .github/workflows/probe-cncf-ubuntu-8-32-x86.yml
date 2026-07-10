@@ -12,6 +12,16 @@ name: Probe cncf-ubuntu-8-32-x86 toolchain
 # get a general sense of how minimal the image is compared to a standard
 # GitHub-hosted runner.
 #
+# Follow-up: the toolchain isn't actually missing. rustup has installed it
+# under $HOME/.cargo/bin, but /etc/environment's PATH contains the literal,
+# unexpanded string "$HOME" (that only expands in interactive/login shells,
+# not the non-interactive shells `run:` steps use), so cargo/rustc are never
+# found. The "Before fix" step below reproduces that with a plain `which
+# cargo`. The "Apply PATH fix" + "After fix" steps validate the workaround:
+# appending the real $HOME/.cargo/bin to $GITHUB_PATH from a step makes it
+# available to subsequent steps (new shell processes pick up the updated
+# GITHUB_PATH).
+#
 # Safe to delete once the investigation is resolved.
 
 on:
@@ -61,3 +71,30 @@ jobs:
           echo "### /usr/bin and /usr/local/bin richness ###"
           ls /usr/bin | wc -l
           ls /usr/local/bin | wc -l
+
+      - name: "Before fix: cargo/rustc via plain PATH (expected to fail)"
+        run: |
+          set +e
+          echo "### raw PATH ###"
+          echo "PATH=$PATH"
+          echo "### which cargo/rustc (expected: not found) ###"
+          which cargo || echo "cargo: not found"
+          which rustc || echo "rustc: not found"
+
+      - name: Apply fix - resolve real $HOME/.cargo/bin onto GITHUB_PATH
+        run: |
+          set -euo pipefail
+          if [ -d "$HOME/.cargo/bin" ]; then
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            echo "Added $HOME/.cargo/bin to GITHUB_PATH"
+          else
+            echo "$HOME/.cargo/bin does not exist, nothing to add"
+          fi
+
+      - name: "After fix: cargo/rustc via GITHUB_PATH (expected to succeed)"
+        run: |
+          echo "### PATH (new shell process, picks up updated GITHUB_PATH) ###"
+          echo "PATH=$PATH"
+          echo "### cargo --version / rustc --version ###"
+          cargo --version
+          rustc --version
