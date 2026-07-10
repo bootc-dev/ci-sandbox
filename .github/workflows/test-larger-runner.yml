@@ -49,3 +49,51 @@ jobs:
           else
             echo "No vmx/svm flags found (expected on arm64; would be concerning on x86)"
           fi
+
+  # Smaller/cheaper tier than the 16-64 pair above. If bootc's actual CI setup
+  # works here, this is the more cost-effective default to propose.
+  probe-8-32:
+    runs-on: cncf-ubuntu-8-32-x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          echo "RUNNER_NAME=$RUNNER_NAME"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          hostname
+          uname -a
+          nproc
+          free -h
+          df -h /
+          cat /etc/os-release
+
+      - name: Check disk is sufficient for bootc CI
+        run: |
+          # bootc-ubuntu-setup + package builds + TMT VM runs need real
+          # headroom; the standard hosted runner's small tier (~72G) is what
+          # produces the ENOSPC flakes we're trying to get away from. Fail
+          # loudly here if this tier doesn't clear a sane bar.
+          avail_kb=$(df -k --output=avail / | tail -1)
+          avail_gb=$((avail_kb / 1024 / 1024))
+          echo "Available on /: ${avail_gb}G"
+          min_gb=100
+          if [ "$avail_gb" -lt "$min_gb" ]; then
+            echo "::error::Only ${avail_gb}G free, want at least ${min_gb}G"
+            exit 1
+          fi
+
+      - name: Run bootc-dev/actions/bootc-ubuntu-setup (with libvirt)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: 'true'
+
+      - name: Verify setup actually left us with a usable toolchain
+        run: |
+          set -xeuo pipefail
+          podman --version
+          buildah --version
+          skopeo --version
+          just --version
+          bcvk --version
+          df -h /
