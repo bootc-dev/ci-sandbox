@@ -1,0 +1,51 @@
+name: Test Larger Runner
+
+# One-off probe for bootc-dev/ci-sandbox#1 ("custom runners aren't accepting
+# jobs"). Exercises the org-level CNCF-provided larger runner labels to see
+# whether jobs actually get scheduled and, if so, whether they have the
+# nested-virt support bootc's TMT-based integration tests need.
+#
+# Safe to delete once the investigation in #1 is resolved.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ['test-larger-runner*']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [cncf-ubuntu-16-64-x86, cncf-ubuntu-16-64-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          echo "runner label: ${{ matrix.runner }}"
+          echo "RUNNER_NAME=$RUNNER_NAME"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          hostname
+          uname -a
+          nproc
+          free -h
+          df -h /
+
+      - name: Check nested virtualization support
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+            echo "KVM device present"
+          else
+            echo "No /dev/kvm device present"
+          fi
+          if grep -qE 'vmx|svm' /proc/cpuinfo 2>/dev/null; then
+            echo "CPU advertises vmx/svm virtualization extensions"
+          else
+            echo "No vmx/svm flags found (expected on arm64; would be concerning on x86)"
+          fi
