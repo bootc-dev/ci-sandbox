@@ -100,6 +100,8 @@ simulated failures:
   (cheap checks that always run)
 - **`ci/fail-build`** — simulates a tier-1 `build` job failure
   (build matrix, runs on labeled PRs and merge queue tip)
+- **`ci/fail-integration`** — simulates a tier-2 `test-integration` job failure
+  (full integration test matrix, runs on merge queue tip)
 
 To use: create the marker file in your branch (e.g., `touch ci/fail-validate`),
 commit, and push. The corresponding CI job will fail when it detects the file.
