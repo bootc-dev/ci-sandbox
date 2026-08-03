@@ -90,6 +90,24 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full
 annotated example. The critical section is the `merge_group` branch of
 `compute-ci-level`.
 
+## Testing CI failures
+
+The workflow supports simulating CI failures for testing the merge-queue
+batching logic. Touch specific marker files in a branch or PR to trigger
+simulated failures:
+
+- **`ci/fail-validate`** — simulates a tier-0 `validate` job failure
+  (cheap checks that always run)
+- **`ci/fail-build`** — simulates a tier-1 `build` job failure
+  (build matrix, runs on labeled PRs and merge queue tip)
+- **`ci/fail-integration`** — simulates a tier-2 `test-integration` job failure
+  (full integration test matrix, runs on merge queue tip)
+
+To use: create the marker file in your branch (e.g., `touch ci/fail-validate`),
+commit, and push. The corresponding CI job will fail when it detects the file.
+This is useful for verifying that the merge queue correctly handles failures
+at different tiers without breaking actual CI logic.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
