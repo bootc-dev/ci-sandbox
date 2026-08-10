@@ -1,6 +1,6 @@
 {
-  "name": "bootc-devenv-debian",
-  "image": "ghcr.io/bootc-dev/devenv-debian",
+  "name": "bootc-devenv-ubuntu",
+  "image": "ghcr.io/bootc-dev/devenv-ubuntu",
   "customizations": {
     "vscode": {
       // Arbitrary, but most of our code is in one of these two
