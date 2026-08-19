@@ -122,15 +122,20 @@ tools:
     min-integrity: approved
     trusted-users: ["${{ vars.GH_AW_APP_BOT_SLUG }}"]
     # Disables the DIFC proxy that gh-aw normally injects around the
-    # pre-fetch steps: block above whenever min-integrity is set. That
-    # proxy can't handle the actions/jobs/{id}/logs endpoint's 302
-    # redirect to Azure Blob Storage, so every `gh api .../logs` call in
-    # the pre-fetch step below fails with "(log download failed or log
-    # expired)" -- confirmed 100% reproducible across live runs. Scoped to
-    # *only* the deterministic gh CLI calls in this workflow's own steps:
-    # block; the agent's own later GitHub MCP tool calls are unaffected
-    # and continue to be filtered by min-integrity/trusted-users above via
-    # the MCP gateway.
+    # pre-fetch steps: block above whenever min-integrity is set.
+    # Verified safe and narrowly scoped (see docs/reference/integrity.md):
+    # this only affects the deterministic gh CLI calls in this workflow's
+    # own steps: block; the agent's own later GitHub MCP tool calls are
+    # unaffected and continue to be filtered by
+    # min-integrity/trusted-users above via the MCP gateway. Left disabled
+    # here as a minor hardening/perf win (skips spinning up the proxy
+    # container for this job) -- NOTE this was originally suspected (and
+    # is documented elsewhere as) the cause of `gh api .../logs` calls
+    # below failing via an unhandled 302 redirect to Azure Blob Storage.
+    # Live testing disproved that: with this set to false and zero DIFC
+    # proxy steps in the compiled job, the log download still failed. The
+    # actual cause was gh CLI's --allow-escape-sequences guard -- see the
+    # comment at the `gh api .../logs` call below.
     integrity-proxy: false
 
 safe-outputs:
@@ -214,7 +219,13 @@ steps:
         jq -r '.[].id' "$BASE_DIR/failed-jobs.json" | while read -r JOB_ID; do
           LOG_FILE="$LOG_DIR/job-${JOB_ID}.log"
           echo "Downloading log for job $JOB_ID..."
-          if gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > "$LOG_FILE" 2>/dev/null; then
+          # --allow-escape-sequences: raw job logs almost always contain
+          # ANSI color codes, and gh refuses to print a response
+          # containing terminal escape sequences without this flag --
+          # without it every download here fails and this falls through
+          # to the "(log download failed or log expired)" placeholder
+          # below, confirmed live.
+          if gh api --allow-escape-sequences "repos/$REPO/actions/jobs/$JOB_ID/logs" > "$LOG_FILE" 2>/dev/null; then
             # cut -c bounds each line's *length* before head/tail bound the
             # line *count* -- the log content is untrusted PR-controlled
             # text, and a single minified JSON or base64 blob on one line
