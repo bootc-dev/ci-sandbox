@@ -36,6 +36,12 @@ jobs:
           wc -l /tmp/plain.out
           echo "--- stderr ---"
           cat /tmp/plain.err
+          echo "=== gh api --allow-escape-sequences (hypothesis: this is the real fix) ==="
+          gh api --allow-escape-sequences "repos/$REPO/actions/jobs/$JOB_ID/logs" > /tmp/allowed.out 2>/tmp/allowed.err
+          echo "exit code: $?"
+          wc -l /tmp/allowed.out
+          echo "--- stderr ---"
+          cat /tmp/allowed.err
           echo "=== curl -v directly against the api.github.com endpoint ==="
           curl -sS -D /tmp/curl_headers.out -o /tmp/curl_body.out -w '\nHTTP_STATUS:%{http_code}\n' \
             -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
