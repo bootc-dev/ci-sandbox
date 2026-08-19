@@ -1,0 +1,37 @@
+name: Debug log fetch
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job ID to fetch logs for"
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: read
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch job logs verbosely
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -x
+          echo "gh version:"
+          gh --version
+          echo "=== gh api -i (headers) ==="
+          gh api -i "repos/$REPO/actions/jobs/$JOB_ID/logs" > /tmp/headers.out 2>/tmp/headers.err
+          echo "exit code: $?"
+          echo "--- stdout (first 40 lines) ---"
+          head -40 /tmp/headers.out || true
+          echo "--- stderr ---"
+          cat /tmp/headers.err || true
+          echo "=== plain gh api (as pre-fetch script does it) ==="
+          gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > /tmp/plain.out 2>/tmp/plain.err
+          echo "exit code: $?"
+          wc -l /tmp/plain.out
+          echo "--- stderr ---"
+          cat /tmp/plain.err || true
