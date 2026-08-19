@@ -121,6 +121,17 @@ tools:
     # real (enforced) guard.
     min-integrity: approved
     trusted-users: ["${{ vars.GH_AW_APP_BOT_SLUG }}"]
+    # Disables the DIFC proxy that gh-aw normally injects around the
+    # pre-fetch steps: block above whenever min-integrity is set. That
+    # proxy can't handle the actions/jobs/{id}/logs endpoint's 302
+    # redirect to Azure Blob Storage, so every `gh api .../logs` call in
+    # the pre-fetch step below fails with "(log download failed or log
+    # expired)" -- confirmed 100% reproducible across live runs. Scoped to
+    # *only* the deterministic gh CLI calls in this workflow's own steps:
+    # block; the agent's own later GitHub MCP tool calls are unaffected
+    # and continue to be filtered by min-integrity/trusted-users above via
+    # the MCP gateway.
+    integrity-proxy: false
 
 safe-outputs:
   github-app:
