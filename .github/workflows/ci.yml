@@ -59,16 +59,22 @@ jobs:
       merge_queue_enabled: ${{ steps.merge-queue.outputs.enabled }}
       docs_only: ${{ steps.docs-check.outputs.docs_only }}
     steps:
-      # On pull requests, check whether only documentation/governance files
-      # (.md) changed.  When that is the case the heavy test jobs are skipped,
-      # saving runner time for process-only PRs (e.g. releases.md, roadmap.md).
-      - name: Check for docs-only changes
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          sparse-checkout: .
+          fetch-depth: 1
+      - name: Detect docs-only PR
         id: docs-check
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh pr diff "${{ github.event.pull_request.number }}" --name-only | grep -qvE '\.md$'; then
+          set -euo pipefail
+          FILES=$(gh pr diff "${{ github.event.pull_request.number }}" --name-only)
+          if [[ -z "$FILES" ]]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          elif grep -qvE '\.md$' <<< "$FILES"; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           else
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
