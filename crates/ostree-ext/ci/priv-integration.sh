@@ -150,15 +150,19 @@ ostree container image prune-images --full --sysroot="${sysroot}"
 # See also https://github.com/coreos/chunkah?tab=readme-ov-file#compatibility-with-bootable-bootc-images
 nonostree_archive=/var/tmp/nonostree.ociarchive
 chunkah_config="$(podman inspect ${image})"
-systemd-run -dP --wait podman run --rm \
-    --mount=type=image,src=${image},dst=/chunkah \
+systemd-run -dP --wait podman info
+systemd-run -dP --wait skopeo copy containers-storage:${image} oci:/var/tmp/fcos-oci:latest
+systemd-run -dP --wait podman --log-level=debug run --rm --network=none \
+    -v /var/tmp/fcos-oci:/chunkah:ro \
     -v /var/tmp:/output:z \
     -e CHUNKAH_CONFIG_STR="${chunkah_config}" \
+    -e RUST_LOG=chunkah=debug \
     quay.io/coreos/chunkah build \
     --prune /sysroot/ \
     --label ostree.commit- \
     --label ostree.final-diffid- \
     -o /output/nonostree.ociarchive
+rm -rf /var/tmp/fcos-oci
 
 # Deploy the non-ostree image with debug logging to capture relabeling messages
 RUST_LOG=ostree_ext=debug ostree container image deploy \

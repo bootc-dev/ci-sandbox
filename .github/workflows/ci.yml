@@ -170,6 +170,9 @@ jobs:
         uses: actions/checkout@v7
       - name: Bootc Ubuntu Setup
         uses: bootc-dev/actions/bootc-ubuntu-setup@main
+      - name: Use native overlay instead of fuse-overlayfs
+        run: |
+          sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf
       - name: Enable fsverity for /
         run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
       - name: Install utils
