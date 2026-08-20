@@ -1,0 +1,145 @@
+# Fourth variant in the "chunkah hang" / systemd-run investigation (bootc
+# PR #2394). The prior variants (repro-chunkah-no-systemd-run.yml,
+# repro-chunkah-delegated-scope.yml) all kept the OUTER `sudo podman run
+# --privileged --pid=host ...` invocation bind-mounting the host's
+# /run/systemd and /run/dbus in (`-v /run/dbus:/run/dbus -v
+# /run/systemd:/run/systemd`) -- that's the bind mount that let
+# `systemd-run` *inside* the container escape to the host's real systemd
+# manager in the first place (see AGENTS.md for the full chain of
+# evidence).
+#
+# This variant asks a different question: what if the outer invocation
+# simply never bind-mounts the host's systemd/dbus sockets at all? Then
+# there is no host systemd/dbus to escape to, at any level, by
+# construction. Two sub-variants of the (already systemd-run-free) inner
+# script are tested against this systemd/dbus-less outer container:
+#  - no-systemd-run: default cgroup manager (systemd), but with no
+#    /run/systemd/private socket inside the container at all. Expected to
+#    fail fast (not hang) if podman's cgroup manager tries to dial the
+#    (now-absent) bus, rather than reproducing the original hang -- since
+#    there's no bind-mounted host systemd to accidentally talk to.
+#  - cgroupfs: systemd-run deleted AND --cgroup-manager=cgroupfs on the
+#    nested podman invocations, same as repro-chunkah-cgroupfs.sh. The
+#    interesting case: repro-chunkah-cgroupfs.sh on its own (outer
+#    container still systemd/dbus-bind-mounted) failed with a real cgroup
+#    delegation error ("pids" controller not delegated) because the OUTER
+#    container's own cgroup, as far as podman's default (systemd) cgroup
+#    manager is concerned, was created via a dbus call to the HOST's
+#    systemd, entangling it with the host's real systemd cgroup tree.
+#    Removing the host bind mounts means the outer container's own
+#    --privileged cgroup namespace is no longer contended with the host's
+#    systemd at all, which might let cgroupfs mode manage the *outer*
+#    container's own delegated cgroup tree cleanly for the nested chunkah
+#    podman run.
+#
+# See crates/ostree-ext/ci/repro-chunkah-no-systemd-run.sh and
+# repro-chunkah-cgroupfs.sh for the actual inner scripts (reused
+# unmodified -- only the OUTER invocation here differs from
+# repro-chunkah-no-systemd-run.yml, by dropping the two `-v` flags).
+#
+# If the cgroupfs sub-variant succeeds, a background poller
+# (capture-chunkah-ns.sh) also confirms the chunkah `podman run` process
+# itself stayed in the outer container's own mnt/ipc namespaces rather
+# than the host's, so success isn't just a coincidental dodge of the
+# original hang.
+name: Repro chunkah hang - no host systemd/dbus bind mounts
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [no-systemd-run, cgroupfs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Ensure strace is available (for hang diagnostics, in case this also hangs)
+        run: |
+          set -x
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
+      - name: Use native overlay instead of fuse-overlayfs
+        run: |
+          sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run repro-chunkah-${{ matrix.variant }}.sh with NO host /run/systemd,/run/dbus bind mounts (with hang watchdog + ns capture)
+        run: |
+          set -xeuo pipefail
+          # Background poller: waits for the chunkah `podman run` client
+          # process to appear (in the shared, --pid=host, host PID
+          # namespace) and records its mnt/ipc namespace identifiers vs.
+          # host PID 1 and the outer container's own entrypoint, for the
+          # "no host-namespace-escape" verification. Harmless (just times
+          # out and says so) if that step is never reached, e.g. because
+          # the no-systemd-run sub-variant fails earlier.
+          sudo bash ./crates/ostree-ext/ci/capture-chunkah-ns.sh /var/tmp/ns-verify.txt 1200 &
+          ns_watcher_pid=$!
+
+          rc=0
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/chunkah-repro.log 300 1200 -- \
+            sudo podman run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              localhost/bootc /src/crates/ostree-ext/ci/repro-chunkah-${{ matrix.variant }}.sh \
+            || rc=$?
+
+          wait "$ns_watcher_pid" || true
+          exit "$rc"
+
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/chunkah-repro.log ]; then
+            cat /var/tmp/chunkah-repro.log
+          else
+            echo "no /var/tmp/chunkah-repro.log found"
+          fi
+
+      - name: Namespace-escape verification (chunkah podman run vs. outer container vs. host PID 1)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/ns-verify.txt ]; then
+            cat /var/tmp/ns-verify.txt
+          else
+            echo "no /var/tmp/ns-verify.txt found (poller never wrote output)"
+          fi
+
+      - name: Verify nonostree.ociarchive was actually created and is non-empty
+        if: always()
+        run: |
+          set -x
+          ls -la /var/tmp/nonostree.ociarchive || echo "MISSING: /var/tmp/nonostree.ociarchive was not created"
+          if [ -s /var/tmp/nonostree.ociarchive ]; then
+            echo "OK: /var/tmp/nonostree.ociarchive exists and is non-empty ($(stat -c%s /var/tmp/nonostree.ociarchive) bytes)"
+          else
+            echo "FAIL: /var/tmp/nonostree.ociarchive is missing or empty"
+            exit 1
+          fi
