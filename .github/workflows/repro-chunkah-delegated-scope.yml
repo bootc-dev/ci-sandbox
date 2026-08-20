@@ -22,6 +22,22 @@
 # demonstrates a fix that needs zero systemd-run usage *inside* the
 # container (i.e. avoids the host-namespace-escape hang entirely), at the
 # cost of a small change to how the OUTER container is invoked by CI.
+#
+# RESULT (run 32392398579): this did NOT work -- identical failure to
+# repro-chunkah-cgroupfs.sh on its own ("crun: controller `pids` is not
+# available under /sys/fs/cgroup/libpod_parent/libpod-<id>/cgroup.controllers"),
+# with the exact same "libpod_parent/libpod-<id>" cgroup path. Wrapping
+# the outer `podman run` in `systemd-run --scope` had no observable
+# effect: podman (cgroupManager=systemd, the default, since we didn't
+# pass --cgroup-manager to the *outer* invocation here) creates its own
+# container cgroup via its own dbus call to systemd under a fixed
+# "libpod_parent" slice, independent of whatever ambient cgroup/scope
+# the calling process happens to be in -- it does not inherit or nest
+# under the systemd-run --scope we wrapped it in. So this specific
+# delegation approach doesn't fix anything; the real, untested next step
+# would be passing --cgroup-manager=cgroupfs to the *outer* `podman run`
+# too (not just the inner ones), so no systemd/dbus interaction happens
+# at any level -- but that's outside this investigation's 3-run budget.
 name: Repro chunkah hang - delegated outer cgroup scope
 
 on:
