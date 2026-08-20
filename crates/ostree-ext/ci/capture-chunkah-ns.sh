@@ -24,14 +24,28 @@ out="${1:?usage: $0 <output-file> [timeout-secs]}"
 timeout_secs="${2:-600}"
 
 find_chunkah_run_pid() {
-    local pid argv joined
+    # Match precisely on the chunkah *image reference* appearing as its own
+    # argv element (quay.io/coreos/chunkah), plus a bare "run" token
+    # elsewhere in argv. This intentionally does NOT do a substring match
+    # against the whole joined command line: the OUTER `podman run
+    # --privileged ...` wrapper's own argv contains both the literal
+    # substring "run" (e.g. in "-v /:/run/host") and the literal substring
+    # "chunkah" (in the script path
+    # ".../repro-chunkah-no-systemd-run.sh"), so a naive substring match
+    # incorrectly matches that wrapper process instead of the actual nested
+    # chunkah invocation.
+    local pid argv a has_run=0 has_chunkah_image=0
     for pid in /proc/[0-9]*; do
         pid=${pid##*/}
         [ -r "/proc/$pid/cmdline" ] || continue
         mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || continue
-        joined="${argv[*]:-}"
-        if [[ "${argv[0]:-}" == */podman || "${argv[0]:-}" == "podman" ]] \
-            && [[ "$joined" == *"run"* ]] && [[ "$joined" == *"chunkah"* ]]; then
+        [[ "${argv[0]:-}" == */podman || "${argv[0]:-}" == "podman" ]] || continue
+        has_run=0; has_chunkah_image=0
+        for a in "${argv[@]}"; do
+            [ "$a" = "run" ] && has_run=1
+            [[ "$a" == "quay.io/coreos/chunkah" ]] && has_chunkah_image=1
+        done
+        if [ "$has_run" -eq 1 ] && [ "$has_chunkah_image" -eq 1 ]; then
             echo "$pid"
             return 0
         fi
