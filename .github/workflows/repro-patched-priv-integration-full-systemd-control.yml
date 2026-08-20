@@ -1,0 +1,107 @@
+# Control experiment for the failure found by
+# repro-patched-priv-integration-full.yml (see that workflow's run
+# 32404058000): the FULL patched priv-integration.sh failed at the
+# `nsenter -m -t 1 journalctl _COMM=bootc` / `grep 'layers already
+# present: '` check (upstream lines ~88-92), well before any
+# systemd-run-bearing section, with an empty host journal for
+# _COMM=bootc.
+#
+# Root cause traced via source: crates/ostree-ext/src/container/store.rs
+# calls `system_repo_journal_print(...)` after a deploy that has layers
+# to fetch, which is gated in crates/ostree-ext/src/logging.rs by
+# `libsystemd::daemon::booted()` -- and libsystemd-rs's `booted()` is
+# simply `fs::symlink_metadata("/run/systemd/system").map(|p|
+# p.is_dir()).unwrap_or(false)`. Without `-v /run/systemd:/run/systemd`,
+# the container's own /run/systemd/system doesn't exist, so `booted()`
+# returns false and the journal write is silently skipped entirely (no
+# error printed anywhere) -- which is exactly why priv-integration.sh's
+# own check (which greps the host journal for that message) then fails.
+# Note /run/dbus is NOT involved in this particular code path at all.
+#
+# This is a genuine, additional dependency on /run/systemd (though NOT
+# /run/dbus, and NOT related to the finalize-staged systemctl call or to
+# any systemd-run subprocess prefix) that the original theory behind the
+# proposed bootc PR #2392 patch did not account for. This workflow is a
+# control: same exact full patched script and outer container flags as
+# repro-patched-priv-integration-full.yml, EXCEPT `-v
+# /run/systemd:/run/systemd` is added back (still no `-v
+# /run/dbus:/run/dbus`), to confirm this specific mount is what's
+# needed, and that nothing else was silently broken.
+name: Repro patched priv-integration.sh (full script, systemd-mount control)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Ensure strace is available (for hang diagnostics, in case this also hangs)
+        run: |
+          set -x
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run the FULL patched priv-integration.sh with /run/systemd added back (control; still no /run/dbus)
+        run: |
+          set -xeuo pipefail
+          rc=0
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/full-patched-repro-control.log 300 2100 -- \
+            sudo podman run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              -v /run/systemd:/run/systemd \
+              localhost/bootc /src/crates/ostree-ext/ci/priv-integration-patched-full.sh \
+            || rc=$?
+          exit "$rc"
+
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/full-patched-repro-control.log ]; then
+            cat /var/tmp/full-patched-repro-control.log
+          else
+            echo "no /var/tmp/full-patched-repro-control.log found"
+          fi
+
+      - name: Check for the final success line
+        if: always()
+        run: |
+          set -x
+          grep -q '^ok privileged integration$' /var/tmp/full-patched-repro-control.log && \
+            echo "FOUND: final 'ok privileged integration' success line" || \
+            (echo "MISSING: final success line not found" && exit 1)
+
+      - name: Grep for any systemd/dbus-related error strings anywhere in the log
+        if: always()
+        run: |
+          set -x
+          if grep -inE 'systemctl|dbus|Failed to connect to bus|finalize-staged' /var/tmp/full-patched-repro-control.log; then
+            echo "FOUND systemd/dbus-related strings above -- inspect closely, this needs scrutiny"
+          else
+            echo "CONFIRMED: zero systemd/dbus-related strings found anywhere in the log"
+          fi
