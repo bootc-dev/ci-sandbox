@@ -42,6 +42,33 @@
 # itself stayed in the outer container's own mnt/ipc namespaces rather
 # than the host's, so success isn't just a coincidental dodge of the
 # original hang.
+#
+# RESULT (run 32398240629, after fixing a process-matcher bug found in
+# the first attempt, run 32397517121 -- see the capture-chunkah-ns.sh fix
+# commit): BOTH sub-variants succeeded, producing an identical
+# 1018138112-byte /var/tmp/nonostree.ociarchive in ~45s with no stalling.
+# `podman info` in both cases reported `cgroupManager: cgroupfs` -- with
+# no /run/systemd/private socket inside the container at all, podman
+# auto-detects and falls back to cgroupfs on its own, even for the
+# no-systemd-run sub-variant that never passes --cgroup-manager
+# explicitly. So dropping the host bind mounts makes explicit
+# --cgroup-manager=cgroupfs unnecessary too: podman's own systemd
+# detection already does the right thing once there's genuinely no
+# systemd socket to find, whereas the earlier repro-chunkah-cgroupfs.sh
+# failure happened specifically because a *live* (but host-owned) systemd
+# socket WAS present and cross-wired against the outer container's own
+# unrelated cgroup.
+#
+# The namespace verification (capture-chunkah-ns.sh, run against the
+# actual nested chunkah `podman run` process, matched precisely on argv
+# containing both a bare "run" token and the "quay.io/coreos/chunkah"
+# image reference) confirmed its mnt/ipc namespace identifiers matched
+# the OUTER container's own entrypoint process, not host PID 1 -- i.e.
+# fixing the hang this way doesn't just coincidentally dodge it, it
+# actually eliminates the host-namespace-escape vector: with no
+# /run/systemd or /run/dbus bind-mounted in, there is no host socket
+# available for anything inside the container to talk to in the first
+# place.
 name: Repro chunkah hang - no host systemd/dbus bind mounts
 
 on:
