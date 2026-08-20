@@ -29,6 +29,47 @@ date -Iseconds
 # to check whether a SIGQUIT-triggered Go goroutine dump propagated there.
 WATCHDOG_LOGFILE="${1:-}"
 
+# --- Locate the outer bootc container's own (isolated) namespace, for later
+# comparison against the hung podman info process. Computed early (before
+# the destructive SIGQUIT step) so it's available to the namespace-escape
+# check below. This is the same lookup used again near the end of the
+# script for the nsenter-based diagnostics; we do it once here and reuse
+# the result.
+OUTER_ID=$(sudo podman ps -a --format '{{.ID}} {{.Image}}' | grep -m1 bootc | awk '{print $1}' || true)
+OUTER_PID=""
+if [ -n "${OUTER_ID:-}" ]; then
+  OUTER_PID=$(sudo podman inspect -f '{{.State.Pid}}' "$OUTER_ID" 2>/dev/null || echo "")
+fi
+
+# --- Test the "escaped to host namespace via bind-mounted systemd/dbus"
+# hypothesis (see AGENTS.md / bootc PR #2394 investigation notes): the
+# outer container bind-mounts /run/systemd and /run/dbus from the HOST,
+# so `systemd-run` inside it talks to the HOST's real systemd manager, and
+# transient units it creates are forked by that manager in *its own*
+# (host) namespaces -- not in the namespaces of the container that asked
+# for them. If true, the hung `podman info` process should show the same
+# mnt/ipc namespace identifiers as host PID 1, NOT the same ones as the
+# outer container's own init process. Capture direct, comparable evidence
+# for this now, before anything gets destroyed by the SIGQUIT step below.
+echo "=== namespace-escape check: host PID 1 (ground truth for 'host namespace') ==="
+sudo readlink /proc/1/ns/mnt /proc/1/ns/ipc 2>&1
+HOST_ROOT_STAT=$(stat -c '%d:%i' / 2>&1)
+echo "host / stat: $HOST_ROOT_STAT"
+
+if [ -n "$OUTER_PID" ] && [ "$OUTER_PID" != "0" ]; then
+  echo "=== namespace-escape check: outer container's own init/entrypoint pid=$OUTER_PID (id=$OUTER_ID) -- this is the container's OWN isolated namespace ==="
+  sudo readlink "/proc/$OUTER_PID/ns/mnt" "/proc/$OUTER_PID/ns/ipc" 2>&1
+  sudo stat -c '%d:%i' "/proc/$OUTER_PID/root" 2>&1
+else
+  echo "=== namespace-escape check: could not determine outer container pid (OUTER_ID='$OUTER_ID') ==="
+fi
+
+echo "=== /dev/shm on host at this point (supporting context: podman's SHM lock segment, if present, would be visible here) ==="
+sudo ls -la /dev/shm/ 2>&1
+
+echo "=== all podman-related processes (broader than just 'podman info'), for context on concurrent lock users ==="
+ps -eo pid,ppid,args --no-headers | grep -i podman | grep -v grep || echo "(none found)"
+
 # --- Locate the actual "podman info" process precisely -------------------
 # Match strictly on argv via /proc/<pid>/cmdline: exactly two arguments,
 # argv[0] a path ending in "podman", argv[1] == "info". This is careful to
@@ -62,6 +103,17 @@ if [ -z "${PODMAN_INFO_PID:-}" ]; then
 else
   echo "=== found: podman info pid=$PODMAN_INFO_PID ==="
   ps -o pid,ppid,stat,wchan:32,args -p "$PODMAN_INFO_PID" || true
+
+  echo "--- namespace-escape check: hung podman info pid=$PODMAN_INFO_PID mnt/ipc namespaces + root stat ---"
+  sudo readlink "/proc/$PODMAN_INFO_PID/ns/mnt" "/proc/$PODMAN_INFO_PID/ns/ipc" 2>&1
+  PODMAN_INFO_ROOT_STAT=$(sudo stat -c '%d:%i' "/proc/$PODMAN_INFO_PID/root" 2>&1)
+  echo "podman info /proc/$PODMAN_INFO_PID/root stat: $PODMAN_INFO_ROOT_STAT"
+  echo "host / stat (repeated for direct comparison): $HOST_ROOT_STAT"
+  if [ "$PODMAN_INFO_ROOT_STAT" = "$HOST_ROOT_STAT" ]; then
+    echo "==> CONCLUSION: podman info's /proc/$PODMAN_INFO_PID/root matches the HOST's real / (same dev:inode) -- it is running with the HOST's rootfs, not the container's overlay rootfs."
+  else
+    echo "==> CONCLUSION: podman info's /proc/$PODMAN_INFO_PID/root does NOT match the host's / -- it has its own (or the container's) rootfs."
+  fi
 
   echo "--- systemd unit wrapping this pid (systemd-run -dP --wait podman info) ---"
   UNIT=""
@@ -178,9 +230,10 @@ sudo ip netns list || true
 echo "=== podman network ls (host) ==="
 sudo podman network ls || true
 
-OUTER_ID=$(sudo podman ps -a --format '{{.ID}} {{.Image}}' | grep -m1 bootc | awk '{print $1}')
+# OUTER_ID/OUTER_PID were already resolved near the top of this script
+# (before the destructive SIGQUIT step); reuse them here rather than
+# re-querying, since the outer container itself is untouched by that step.
 if [ -n "${OUTER_ID:-}" ]; then
-  OUTER_PID=$(sudo podman inspect -f '{{.State.Pid}}' "$OUTER_ID")
   echo "=== outer container: id=$OUTER_ID pid=$OUTER_PID ==="
   if [ -n "$OUTER_PID" ] && [ "$OUTER_PID" != "0" ]; then
     echo "=== nsenter ps auxf ==="
