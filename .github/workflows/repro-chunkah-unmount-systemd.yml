@@ -1,0 +1,108 @@
+# Sixth variant in the "chunkah hang" / systemd-run investigation. See
+# crates/ostree-ext/ci/repro-chunkah-unmount-systemd.sh for the full
+# rationale: tests whether unmounting /run/systemd from *inside* the
+# already-running outer container, right before the systemd-run-free
+# chunkah section, is enough to get clean cgroupfs delegation -- as
+# opposed to the three prior experiments (5a3779dc,
+# repro-chunkah-systemd-journal-cgroupfs.yml) that all kept /run/systemd
+# mounted for the outer container's entire lifetime and all failed
+# identically ("pids controller not available") regardless of
+# --cgroup-manager flags.
+#
+# If this works, it means priv-integration.sh could keep a single podman
+# invocation, mount /run/systemd (not /run/dbus, never needed) for the
+# early ostree-admin/journalctl-verification part of the script, then
+# unmount it itself right before the systemd-run-free
+# derived-image/chunkah part -- fixing both the hang and the journal
+# logging regression with one script, no ci.yml restructuring needed.
+name: Repro chunkah hang - unmount /run/systemd mid-script
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Ensure strace is available (for hang diagnostics, in case this also hangs)
+        run: |
+          set -x
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
+      - name: Use native overlay instead of fuse-overlayfs
+        run: |
+          sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run repro-chunkah-unmount-systemd.sh (outer keeps /run/systemd at creation, script unmounts it before chunkah)
+        run: |
+          set -xeuo pipefail
+          sudo bash ./crates/ostree-ext/ci/capture-chunkah-ns.sh /var/tmp/ns-verify.txt 1200 &
+          ns_watcher_pid=$!
+
+          rc=0
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/chunkah-repro.log 300 1200 -- \
+            sudo podman run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              -v /run/systemd:/run/systemd \
+              localhost/bootc /src/crates/ostree-ext/ci/repro-chunkah-unmount-systemd.sh \
+            || rc=$?
+
+          wait "$ns_watcher_pid" || true
+          exit "$rc"
+
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/chunkah-repro.log ]; then
+            cat /var/tmp/chunkah-repro.log
+          else
+            echo "no /var/tmp/chunkah-repro.log found"
+          fi
+
+      - name: Namespace-escape verification (chunkah podman run vs. outer container vs. host PID 1)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/ns-verify.txt ]; then
+            cat /var/tmp/ns-verify.txt
+          else
+            echo "no /var/tmp/ns-verify.txt found (poller never wrote output)"
+          fi
+
+      - name: Verify nonostree.ociarchive was actually created and is non-empty
+        if: always()
+        run: |
+          set -x
+          ls -la /var/tmp/nonostree.ociarchive || echo "MISSING: /var/tmp/nonostree.ociarchive was not created"
+          if [ -s /var/tmp/nonostree.ociarchive ]; then
+            echo "OK: /var/tmp/nonostree.ociarchive exists and is non-empty ($(stat -c%s /var/tmp/nonostree.ociarchive) bytes)"
+          else
+            echo "FAIL: /var/tmp/nonostree.ociarchive is missing or empty"
+            exit 1
+          fi
