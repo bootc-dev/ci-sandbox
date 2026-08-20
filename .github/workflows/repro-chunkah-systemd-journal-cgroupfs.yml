@@ -1,0 +1,130 @@
+# Fifth variant in the "chunkah hang" / systemd-run investigation (bootc
+# PR #2392/#2394).
+#
+# Context: PR #2392 as currently pushed drops BOTH `-v /run/dbus:/run/dbus`
+# and `-v /run/systemd:/run/systemd` from the outer `sudo podman run`
+# invocation, and deletes every `systemd-run -dP --wait` prefix inside
+# priv-integration.sh. repro-chunkah-no-host-systemd.yml (run 32398240629)
+# confirmed that combination fixes the chunkah hang cleanly. But a
+# full-script validation (repro-patched-priv-integration-full.yml, run
+# 32404058000) found a second, unrelated regression: with /run/systemd
+# gone, ostree_ext::logging's libsystemd::daemon::booted() check (just a
+# stat of /run/systemd/system) goes false, so ostree-ext silently stops
+# writing its "layers already present" status message to the journal --
+# and priv-integration.sh asserts on exactly that message via `nsenter -m
+# -t 1 journalctl _COMM=bootc`. A control run that added /run/systemd back
+# (dbus still excluded) confirmed the journal write itself works once
+# /run/systemd exists (repro-patched-priv-integration-full-systemd-control.yml,
+# run 32404714375) -- but that control still had systemd-run deleted from
+# the script, and hit the *original* cgroup-delegation failure again at
+# the derived-image podman build, because the OUTER container's own cgroup
+# placement goes back to talking to the leaked HOST systemd via dbus the
+# moment /run/systemd is present, independent of whether anything inside
+# the container still calls systemd-run.
+#
+# 5a3779dc/4f0a5374 (the delegated-scope experiment, back when this was
+# investigated at the chunkah-only level) already flagged the next idea to
+# try: force --cgroup-manager=cgroupfs on the *outer* invocation too, not
+# just the nested one, so podman never asks systemd (real or leaked) for a
+# cgroup at ANY level of the chain -- while still leaving /run/systemd
+# mounted so booted() (and thus journal logging) keeps working. That
+# combination has never actually been tested; this workflow tests it, at
+# the chunkah-only level first (cheaper / faster to iterate than the full
+# script).
+#
+# Only /run/dbus is dropped here (never needed by anything in this
+# script -- confirmed back in repro-chunkah-no-systemd-run.yml, where
+# podman info/skopeo copy needed neither systemd-run nor dbus). /run/systemd
+# stays, but with cgroupfs forced at both levels so its mere presence can't
+# route any cgroup operation back through the host's real systemd.
+name: Repro chunkah hang - keep /run/systemd for journal, force cgroupfs everywhere
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Ensure strace is available (for hang diagnostics, in case this also hangs)
+        run: |
+          set -x
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
+      - name: Use native overlay instead of fuse-overlayfs
+        run: |
+          sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run repro-chunkah-cgroupfs.sh with /run/systemd (no /run/dbus) and --cgroup-manager=cgroupfs on the OUTER invocation too
+        run: |
+          set -xeuo pipefail
+          sudo bash ./crates/ostree-ext/ci/capture-chunkah-ns.sh /var/tmp/ns-verify.txt 1200 &
+          ns_watcher_pid=$!
+
+          rc=0
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/chunkah-repro.log 300 1200 -- \
+            sudo podman --cgroup-manager=cgroupfs run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              -v /run/systemd:/run/systemd \
+              localhost/bootc /src/crates/ostree-ext/ci/repro-chunkah-cgroupfs.sh \
+            || rc=$?
+
+          wait "$ns_watcher_pid" || true
+          exit "$rc"
+
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/chunkah-repro.log ]; then
+            cat /var/tmp/chunkah-repro.log
+          else
+            echo "no /var/tmp/chunkah-repro.log found"
+          fi
+
+      - name: Namespace-escape verification (chunkah podman run vs. outer container vs. host PID 1)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/ns-verify.txt ]; then
+            cat /var/tmp/ns-verify.txt
+          else
+            echo "no /var/tmp/ns-verify.txt found (poller never wrote output)"
+          fi
+
+      - name: Verify nonostree.ociarchive was actually created and is non-empty
+        if: always()
+        run: |
+          set -x
+          ls -la /var/tmp/nonostree.ociarchive || echo "MISSING: /var/tmp/nonostree.ociarchive was not created"
+          if [ -s /var/tmp/nonostree.ociarchive ]; then
+            echo "OK: /var/tmp/nonostree.ociarchive exists and is non-empty ($(stat -c%s /var/tmp/nonostree.ociarchive) bytes)"
+          else
+            echo "FAIL: /var/tmp/nonostree.ociarchive is missing or empty"
+            exit 1
+          fi
