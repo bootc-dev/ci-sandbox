@@ -23,6 +23,17 @@
 # See repro-patched-priv-integration.sh for exactly what's included vs.
 # skipped (the ostree-sysroot-dependent lines in between, which have no
 # systemd-run call sites and aren't affected by this fix).
+#
+# RESULT (run 32401788878): success in 3m5s, no hang, no watchdog stall.
+# `podman build -t localhost/fcos-derived .` and both `skopeo copy`
+# calls (all with systemd-run deleted) succeeded, and the chunkah
+# `podman run` produced a valid 1766224384-byte nonostree.ociarchive.
+# capture-chunkah-ns.sh confirmed the chunkah podman run process's
+# mnt/ipc namespaces matched the outer container's own entrypoint, not
+# the host's -- consistent with repro-chunkah-no-host-systemd.yml's
+# earlier finding, now confirmed against the real patched command text
+# for both systemd-run sections instead of a simplified stand-in. This
+# is the final validation before proposing the patch upstream.
 name: Repro patched priv-integration.sh (final validation)
 
 on:
