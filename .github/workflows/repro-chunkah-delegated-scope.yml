@@ -1,0 +1,99 @@
+# Third variant in the "chunkah hang" / systemd-run investigation
+# (bootc PR #2394): repro-chunkah-no-systemd-run.yml proved that simply
+# deleting `systemd-run -dP --wait` (repro-chunkah-no-systemd-run.sh) or
+# adding --cgroup-manager=cgroupfs to just the nested podman invocations
+# (repro-chunkah-cgroupfs.sh) both fail with real cgroup delegation
+# errors from crun -- so systemd-run WAS doing real work here (giving the
+# nested `podman run` a valid, permitted cgroup to create its own
+# container's cgroup under).
+#
+# This variant tests a third option: give the OUTER `podman run
+# --privileged` container itself a properly delegated cgroup scope by
+# wrapping *that* invocation in `systemd-run --scope` -- which is safe to
+# do because the outer invocation runs directly on the actual host (the
+# GitHub Actions runner), not nested inside anything, so there's no
+# namespace-escape hazard. Then, entirely INSIDE the container, we use
+# repro-chunkah-cgroupfs.sh (--cgroup-manager=cgroupfs, no systemd-run at
+# all) to manage cgroups for the nested chunkah `podman run` directly via
+# cgroupfs as a child of that now-delegated cgroup, without touching
+# systemd/dbus from inside the container at all.
+#
+# If this works end-to-end (nonostree.ociarchive created, non-empty), it
+# demonstrates a fix that needs zero systemd-run usage *inside* the
+# container (i.e. avoids the host-namespace-escape hang entirely), at the
+# cost of a small change to how the OUTER container is invoked by CI.
+name: Repro chunkah hang - delegated outer cgroup scope
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Ensure strace is available (for hang diagnostics, in case this also hangs)
+        run: |
+          set -x
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
+      - name: Use native overlay instead of fuse-overlayfs
+        run: |
+          sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run repro-chunkah-cgroupfs.sh inside a delegated outer systemd-run scope (with hang watchdog)
+        run: |
+          set -xeuo pipefail
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/chunkah-repro.log 300 1200 -- \
+            sudo systemd-run --scope --collect -- \
+              podman run --privileged --pid=host \
+                -v /:/run/host \
+                -v $(pwd):/src:ro \
+                -v /var/tmp:/var/tmp \
+                --tmpfs /var/lib/containers \
+                -v /run/dbus:/run/dbus \
+                -v /run/systemd:/run/systemd \
+                localhost/bootc /src/crates/ostree-ext/ci/repro-chunkah-cgroupfs.sh
+
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/chunkah-repro.log ]; then
+            cat /var/tmp/chunkah-repro.log
+          else
+            echo "no /var/tmp/chunkah-repro.log found"
+          fi
+
+      - name: Verify nonostree.ociarchive was actually created and is non-empty
+        if: always()
+        run: |
+          set -x
+          ls -la /var/tmp/nonostree.ociarchive || echo "MISSING: /var/tmp/nonostree.ociarchive was not created"
+          if [ -s /var/tmp/nonostree.ociarchive ]; then
+            echo "OK: /var/tmp/nonostree.ociarchive exists and is non-empty ($(stat -c%s /var/tmp/nonostree.ociarchive) bytes)"
+          else
+            echo "FAIL: /var/tmp/nonostree.ociarchive is missing or empty"
+            exit 1
+          fi
