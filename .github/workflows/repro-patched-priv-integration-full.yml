@@ -29,6 +29,31 @@
 # what was changed (only the 4 `systemd-run -dP --wait ` prefixes
 # deleted; everything else is byte-for-byte upstream bootc-dev/bootc
 # commit fceedf69901f8e0ede49d9ce1974a76a39dd3eb1).
+#
+# RESULT (run 32404058000): FAILED after ~3 min, not a hang. All of
+# upstream lines 1-84 (ostree admin init-fs/os-init, all the container
+# image deploy/status/metadata/remove/undeploy/prune-images/prune-layers
+# calls, the enforce-container-sigpolicy negative test, and the
+# deploy/remove/undeploy loop with ref-count checks) ran cleanly with
+# correct output and zero systemctl/dbus/"Failed to connect to
+# bus"/finalize-staged strings anywhere in the log. It then failed at
+# upstream lines 88-92: `nsenter -m -t 1 journalctl _COMM=bootc | grep
+# 'layers already present: '` found nothing (`-- No entries --`), so the
+# script's own `if ! grep ...; then exit 1; fi` check tripped.
+#
+# Root cause (see repro-patched-priv-integration-full-systemd-control.yml
+# for the confirming control experiment): the message is written by
+# ostree_ext::container::store's system_repo_journal_print, which is
+# gated by libsystemd::daemon::booted() in
+# crates/ostree-ext/src/logging.rs -- and booted() is just `is_dir()` on
+# /run/systemd/system. Without -v /run/systemd:/run/systemd, that path
+# doesn't exist in the container, so the journal write is silently
+# skipped (no error text anywhere), and the *deploys themselves* still
+# succeed correctly -- only this one status-log assertion in the test
+# script fails. This is a real, if narrow, additional need for
+# /run/systemd (NOT /run/dbus, and unrelated to the finalize-staged
+# systemctl path) that the original source analysis missed. The script
+# never reached "ok privileged integration".
 name: Repro patched priv-integration.sh (full script, final validation)
 
 on:

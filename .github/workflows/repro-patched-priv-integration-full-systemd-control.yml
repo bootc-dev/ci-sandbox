@@ -27,6 +27,26 @@
 # /run/systemd:/run/systemd` is added back (still no `-v
 # /run/dbus:/run/dbus`), to confirm this specific mount is what's
 # needed, and that nothing else was silently broken.
+#
+# RESULT (run 32404714375): the hypothesis was confirmed AND a second,
+# already-known issue was uncovered. With /run/systemd added back, the
+# journal now shows `bootc[17090]: layers already present: 0; layers
+# needed: 66 (1.0 GB)`, the grep check passes, and the script proceeds
+# past "ok pulled from containers storage" -- confirming booted() /
+# /run/systemd/system was exactly the missing piece from the primary
+# run. However, the script then fails at `podman build -t
+# localhost/fcos-derived .` (`Error: building at STEP "RUN touch
+# /usr/share/somefile": while running runtime: exit status 1`). This is
+# NOT a new mystery: it's the same nested-podman cgroup-delegation
+# failure documented in ci: Confirm systemd-run removal breaks nested
+# podman cgroup delegation (commit d906a0c2) -- removing systemd-run
+# while /run/systemd is still mounted lets podman inside the container
+# detect systemd and try (and fail) to use the systemd cgroup manager,
+# which is exactly why the real proposed patch removes systemd-run AND
+# both host mounts together, never just one side. This control run
+# therefore does not represent a viable alternative fix; it just
+# isolates why the *exact* proposed patch (both mounts removed) fails
+# priv-integration.sh's own journal-message check.
 name: Repro patched priv-integration.sh (full script, systemd-mount control)
 
 on:
