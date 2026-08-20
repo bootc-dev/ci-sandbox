@@ -34,7 +34,7 @@ while kill -0 "$run_pid" 2>/dev/null; do
         {
             echo "=== HANG DETECTED (stalled ${stalled}s, elapsed ${elapsed}s) ==="
             echo '```'
-            sudo bash "${script_dir}/dump-hang-diagnostics.sh" 2>&1
+            sudo bash "${script_dir}/dump-hang-diagnostics.sh" "$logfile" 2>&1
             echo '```'
         } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
         kill -9 "$run_pid" 2>/dev/null || true

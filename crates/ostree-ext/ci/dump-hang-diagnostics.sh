@@ -2,8 +2,11 @@
 # Dump diagnostics about the host and any nested podman/outer bootc
 # container, for use by a watchdog that suspects a hung chunkah/podman
 # step (see repro-chunkah-hang.yml and the AGENTS.md investigation notes
-# for bootc PR #2394). Safe to run repeatedly; read-only except for the
-# strace snippet which attaches/detaches briefly.
+# for bootc PR #2394). Mostly read-only (the strace snippet just
+# attaches/detaches briefly), EXCEPT for the final step: sending SIGQUIT
+# to the hung `podman info` to force a Go runtime goroutine dump. That
+# step is intentionally destructive (it terminates the hung process) and
+# must stay last.
 #
 # NOTE on PID namespaces: the outer container in repro-chunkah-hang.yml is
 # started with `--pid=host`, which means every process it (transitively)
@@ -19,6 +22,12 @@
 # exactly the case here.
 set -x
 date -Iseconds
+
+# Optional: path to the watchdog's captured stdout+stderr log for the
+# command tree that contains the hung `podman info` (see run-with-hang-watchdog.sh,
+# which passes its own $logfile as $1). Used at the very end of this script
+# to check whether a SIGQUIT-triggered Go goroutine dump propagated there.
+WATCHDOG_LOGFILE="${1:-}"
 
 # --- Locate the actual "podman info" process precisely -------------------
 # Match strictly on argv via /proc/<pid>/cmdline: exactly two arguments,
@@ -107,6 +116,45 @@ else
     echo "!!! strace not installed on host runner -- cannot capture a syscall trace this run."
     echo "!!! Add 'sudo apt-get install -y strace' as a workflow step to fix this."
   fi
+
+  # --- LAST resort / destructive: force a Go runtime goroutine dump -------
+  # All prior diagnostics above are passive/read-only. This one is not: Go
+  # binaries that don't install their own SIGQUIT handler (podman doesn't)
+  # respond to SIGQUIT by having the runtime print every goroutine's stack
+  # trace to stderr and then terminate the process. That's exactly what we
+  # want to pin down *which* internal wait (mutex/channel/waitgroup) the
+  # hang is stuck on, but it does kill the hung process, so this must run
+  # after everything else that needs the process still alive.
+  #
+  # `podman info` here was launched via `systemd-run -dP --wait podman info`
+  # inside repro-chunkah-only.sh. The `-P`/`--pipe` flag makes systemd-run
+  # forward the transient unit's stdout/stderr back through its own
+  # stdout/stderr, which is in turn inherited by the outer `podman run`
+  # container and ultimately redirected by run-with-hang-watchdog.sh into
+  # $WATCHDOG_LOGFILE. So the goroutine dump *should* land there. Confirm
+  # that empirically rather than assuming it, and also check the journal
+  # (systemd separately archives transient-unit output there by unit name)
+  # as a fallback/supplement.
+  echo "--- sending SIGQUIT to podman info pid=$PODMAN_INFO_PID to force a Go runtime goroutine dump (DESTRUCTIVE: process will exit after this) ---"
+  sudo kill -QUIT "$PODMAN_INFO_PID" 2>&1 || echo "(kill -QUIT failed, pid may already be gone)"
+  sleep 5
+
+  echo "--- confirming pid=$PODMAN_INFO_PID is actually gone (proof the signal was delivered and had effect) ---"
+  if ps -p "$PODMAN_INFO_PID" -o pid,stat,args --no-headers 2>/dev/null; then
+    echo "!!! pid=$PODMAN_INFO_PID is STILL PRESENT after SIGQUIT + 5s sleep"
+  else
+    echo "pid=$PODMAN_INFO_PID is gone: SIGQUIT was delivered and the process exited"
+  fi
+
+  if [ -n "$WATCHDOG_LOGFILE" ] && [ -r "$WATCHDOG_LOGFILE" ]; then
+    echo "--- tail -300 of watchdog logfile ($WATCHDOG_LOGFILE): goroutine dump should appear here if the systemd-run -P pipe propagated it ---"
+    tail -300 "$WATCHDOG_LOGFILE" 2>&1
+  else
+    echo "(no readable watchdog logfile passed as \$1 to this script; got: '${WATCHDOG_LOGFILE:-<empty>}')"
+  fi
+
+  echo "--- fallback/supplement: journalctl for run-*.service transient units (systemd archives their stdout/stderr to the journal by unit name too) ---"
+  sudo journalctl -u 'run-*' --no-pager -o cat 2>&1 | tail -300
 fi
 
 echo "=== ps auxf ==="
