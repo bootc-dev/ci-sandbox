@@ -1,0 +1,98 @@
+# Fast repro for the "chunkah hang" seen in bootc PR #2394's "Test install"
+# job, without needing to compile bootc from source. Uses a pre-built
+# dev-bootc container image as a substitute for the locally-built
+# `localhost/bootc`, and a trimmed script that only runs the chunkah
+# conversion step (the one implicated in the hang).
+name: Repro chunkah hang
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start tmate (detached), post SSH URL to issue #64
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          curl -fsSL https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz \
+            | tar -xJ --strip-components=1 -C /usr/local/bin tmate-2.4.0-static-linux-amd64/tmate
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          SSH_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          {
+            echo "## Tmate session (fast-repro path)"
+            echo "SSH: \`$SSH_URL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh issue comment 64 --repo bootc-dev/cgwalters-ci-sandbox \
+            --body "**tmate session ready** (fast-repro run [$GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)): \`$SSH_URL\`" \
+            || echo "issue comment failed, SSH URL was: $SSH_URL"
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Use native overlay instead of fuse-overlayfs
+        run: |
+          sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run chunkah-only repro script (with hang watchdog)
+        run: |
+          set -xeuo pipefail
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/chunkah-repro.log 300 1800 -- \
+            sudo podman run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              -v /run/dbus:/run/dbus \
+              -v /run/systemd:/run/systemd \
+              localhost/bootc /src/crates/ostree-ext/ci/repro-chunkah-only.sh
+
+      - name: Run full priv-integration.sh (only if chunkah-only passed)
+        run: |
+          set -xeuo pipefail
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/priv-integration.log 300 3000 -- \
+            sudo podman run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              -v /run/dbus:/run/dbus \
+              -v /run/systemd:/run/systemd \
+              localhost/bootc /src/crates/ostree-ext/ci/priv-integration.sh
+
+      - name: Tmate for debugging (on failure/hang), blocks for a while
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          if [ ! -S /tmp/tmate.sock ]; then
+            echo "no tmate session found, nothing to keep alive"
+            exit 0
+          fi
+          SSH_URL=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || echo "unknown")
+          echo "Keeping tmate session alive: $SSH_URL"
+          gh issue comment 64 --repo bootc-dev/cgwalters-ci-sandbox \
+            --body "**job finished/failed** (fast-repro run [$GITHUB_RUN_ID](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)), tmate still alive: \`$SSH_URL\`" \
+            || true
+          timeout 600 bash -c 'until [ -f /tmp/continue ]; do sleep 10; done' || true
