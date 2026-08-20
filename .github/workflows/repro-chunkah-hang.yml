@@ -40,6 +40,20 @@ jobs:
       - name: Bootc Ubuntu Setup
         uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
+      - name: Ensure strace is available (for hang diagnostics)
+        run: |
+          set -x
+          # Not part of the default ubuntu-24.04 runner image, and
+          # bootc-ubuntu-setup doesn't install it either -- needed by
+          # dump-hang-diagnostics.sh to capture a live syscall trace of a
+          # hung process. Since we run --pid=host, this strace on the host
+          # can trace processes spawned deep inside the nested containers.
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
       - name: Use native overlay instead of fuse-overlayfs
         run: |
           sudo sed -i 's|mount_program.*|mount_program = ""|' /etc/containers/storage.conf

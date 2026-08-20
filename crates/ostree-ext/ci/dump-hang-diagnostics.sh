@@ -4,8 +4,111 @@
 # step (see repro-chunkah-hang.yml and the AGENTS.md investigation notes
 # for bootc PR #2394). Safe to run repeatedly; read-only except for the
 # strace snippet which attaches/detaches briefly.
+#
+# NOTE on PID namespaces: the outer container in repro-chunkah-hang.yml is
+# started with `--pid=host`, which means every process it (transitively)
+# spawns -- including the `podman info` we're chasing here -- lives
+# directly in the *host's* PID namespace. There is no need to nsenter
+# into the container's PID namespace to see or ptrace these processes;
+# doing so was actually the bug in an earlier version of this script (it
+# nsentered into the container's *mount* namespace to run strace, where
+# strace isn't installed, and also matched the wrong process -- the
+# `podman run`/`systemd-run` wrapper instead of the actual `podman info`
+# child). ptrace works fine across mount namespaces as long as we have
+# CAP_SYS_PTRACE and share a PID namespace with the target, which is
+# exactly the case here.
 set -x
 date -Iseconds
+
+# --- Locate the actual "podman info" process precisely -------------------
+# Match strictly on argv via /proc/<pid>/cmdline: exactly two arguments,
+# argv[0] a path ending in "podman", argv[1] == "info". This is careful to
+# avoid matching:
+#  - the `systemd-run -dP --wait podman info` wrapper (argv[0] is
+#    systemd-run, not podman)
+#  - `podman run ...` (the outer wrapper container, or the chunkah build)
+#  - stray `podman pull` / `podman inspect` processes that may be running
+#    concurrently earlier/later in the script
+find_podman_info_pid() {
+  local pid argv
+  for pid in /proc/[0-9]*; do
+    pid=${pid##*/}
+    [ -r "/proc/$pid/cmdline" ] || continue
+    argv=()
+    mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || continue
+    if [ "${#argv[@]}" -eq 2 ] && [[ "${argv[0]}" == */podman || "${argv[0]}" == "podman" ]] && [ "${argv[1]}" = "info" ]; then
+      echo "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+echo "=== searching host PID namespace for the exact 'podman info' process ==="
+PODMAN_INFO_PID=$(find_podman_info_pid || true)
+if [ -z "${PODMAN_INFO_PID:-}" ]; then
+  echo "=== no exact 'podman info' process found (argv == [.../podman, info]) ==="
+  echo "=== all processes with comm=podman, for context ==="
+  ps -eo pid,ppid,stat,comm,args --no-headers | awk '$4=="podman"'
+else
+  echo "=== found: podman info pid=$PODMAN_INFO_PID ==="
+  ps -o pid,ppid,stat,wchan:32,args -p "$PODMAN_INFO_PID" || true
+
+  echo "--- systemd unit wrapping this pid (systemd-run -dP --wait podman info) ---"
+  UNIT=""
+  while read -r u; do
+    [ -n "$u" ] || continue
+    mp=$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo "")
+    if [ "$mp" = "$PODMAN_INFO_PID" ]; then
+      UNIT="$u"
+      break
+    fi
+  done < <(systemctl list-units 'run-*' --no-pager --plain --no-legend 2>/dev/null | awk '{print $1}')
+  if [ -n "$UNIT" ]; then
+    systemctl status "$UNIT" --no-pager 2>&1 || true
+  else
+    echo "(no matching run-*.service unit found for pid $PODMAN_INFO_PID)"
+  fi
+
+  echo "--- /proc/$PODMAN_INFO_PID/status ---"
+  cat "/proc/$PODMAN_INFO_PID/status" 2>&1
+
+  echo "--- /proc/$PODMAN_INFO_PID/wchan (main thread only) ---"
+  cat "/proc/$PODMAN_INFO_PID/wchan" 2>&1; echo
+
+  echo "--- /proc/$PODMAN_INFO_PID/stack (may require elevated perms/CONFIG_STACKTRACE) ---"
+  sudo cat "/proc/$PODMAN_INFO_PID/stack" 2>&1
+
+  echo "--- wchan across ALL threads (podman is a multi-threaded Go binary; the blocked goroutine's OS thread may not be the main one) ---"
+  for t in "/proc/$PODMAN_INFO_PID"/task/*/wchan; do
+    [ -r "$t" ] || continue
+    tid=$(basename "$(dirname "$t")")
+    printf 'tid=%s wchan=' "$tid"
+    cat "$t" 2>&1
+    echo
+  done
+
+  echo "--- open fds ---"
+  ls -l "/proc/$PODMAN_INFO_PID/fd" 2>&1
+
+  echo "--- /proc/$PODMAN_INFO_PID/net/tcp + tcp6 (sockets in this process's netns; ESTABLISHED/SYN_SENT rows = live network I/O, e.g. registry/DNS calls) ---"
+  cat "/proc/$PODMAN_INFO_PID/net/tcp" 2>&1
+  cat "/proc/$PODMAN_INFO_PID/net/tcp6" 2>&1
+
+  echo "--- lslocks (flock/fcntl locks system-wide; look for containers-storage db/lock paths) ---"
+  sudo lslocks 2>&1 || true
+
+  if command -v strace >/dev/null 2>&1; then
+    echo "--- strace -p $PODMAN_INFO_PID -f -tt for ~12s (direct on host, no nsenter: ptrace works across mount namespaces given --pid=host + CAP_SYS_PTRACE) ---"
+    sudo timeout 12 strace -p "$PODMAN_INFO_PID" -f -tt -o /var/tmp/strace-hang.out
+    echo "--- strace output (/var/tmp/strace-hang.out) ---"
+    cat /var/tmp/strace-hang.out 2>&1
+  else
+    echo "!!! strace not installed on host runner -- cannot capture a syscall trace this run."
+    echo "!!! Add 'sudo apt-get install -y strace' as a workflow step to fix this."
+  fi
+fi
+
 echo "=== ps auxf ==="
 ps auxf
 echo "=== sudo podman ps -a --no-trunc ==="
@@ -40,15 +143,6 @@ if [ -n "${OUTER_ID:-}" ]; then
     sudo nsenter -t "$OUTER_PID" -m -u -i -n -p -- systemctl list-units 'run-*' --no-pager || true
     echo "=== nsenter ls -la /var/tmp ==="
     sudo nsenter -t "$OUTER_PID" -m -u -i -n -p -- ls -la /var/tmp/ || true
-
-    # If a specific process looks stuck, grab a few seconds of strace on it.
-    STUCK_PID=$(sudo nsenter -t "$OUTER_PID" -m -u -i -n -p -- ps -eo pid,comm --no-headers \
-      | grep -m1 -E 'podman|skopeo|conmon|chunkah' | awk '{print $1}')
-    if [ -n "${STUCK_PID:-}" ]; then
-      echo "=== strace -p $STUCK_PID for 5s (via nsenter) ==="
-      sudo nsenter -t "$OUTER_PID" -m -u -i -n -p -- \
-        timeout 5 strace -p "$STUCK_PID" -f 2>&1 || true
-    fi
   fi
 else
   echo "=== no outer bootc container found in podman ps -a ==="
