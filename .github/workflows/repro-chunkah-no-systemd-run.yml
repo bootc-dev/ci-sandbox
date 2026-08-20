@@ -65,6 +65,16 @@ jobs:
               -v /run/systemd:/run/systemd \
               localhost/bootc /src/crates/ostree-ext/ci/repro-chunkah-${{ matrix.variant }}.sh
 
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/chunkah-repro.log ]; then
+            cat /var/tmp/chunkah-repro.log
+          else
+            echo "no /var/tmp/chunkah-repro.log found"
+          fi
+
       - name: Verify nonostree.ociarchive was actually created and is non-empty
         if: always()
         run: |

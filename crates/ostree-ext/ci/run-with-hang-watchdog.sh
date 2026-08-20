@@ -44,8 +44,8 @@ while kill -0 "$run_pid" 2>/dev/null; do
     fi
 done
 
-wait "$run_pid"
-rc=$?
+rc=0
+wait "$run_pid" || rc=$?
 echo "--- command log ---"
 cat "$logfile"
 exit "$rc"
