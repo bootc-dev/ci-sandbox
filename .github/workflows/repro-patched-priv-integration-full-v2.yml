@@ -1,0 +1,96 @@
+# Full end-to-end validation of the CORRECTED patch (see
+# crates/ostree-ext/ci/priv-integration-patched-full-v2.sh for the full
+# rationale) -- supersedes repro-patched-priv-integration-full.yml, whose
+# run 32404058000 found the original patch broke the journalctl-based
+# journal check even though it fixed the chunkah hang.
+#
+# The corrected patch keeps `-v /run/systemd:/run/systemd` on the outer
+# invocation (drops only /run/dbus) and has the script itself `umount
+# /run/systemd` right after the journal check, before any of the
+# systemd-run-free podman/build work later in the script.
+name: Repro patched priv-integration.sh v2 (full script, corrected fix)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Ensure strace is available (for hang diagnostics, in case this also hangs)
+        run: |
+          set -x
+          if ! command -v strace >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y strace
+          fi
+          strace -V
+
+      - name: Verify image exists and pull
+        run: |
+          set -xeuo pipefail
+          IMAGE=ghcr.io/bootc-dev/dev-bootc:centos-10
+          skopeo inspect docker://${IMAGE} | jq '.Digest, .Labels'
+          sudo podman pull ${IMAGE}
+          sudo podman tag ${IMAGE} localhost/bootc
+
+      - name: Run the FULL patched priv-integration.sh with the corrected outer podman flags (/run/systemd kept, /run/dbus dropped)
+        run: |
+          set -xeuo pipefail
+          rc=0
+          ./crates/ostree-ext/ci/run-with-hang-watchdog.sh \
+            /var/tmp/full-patched-repro-v2.log 300 2100 -- \
+            sudo podman run --privileged --pid=host \
+              -v /:/run/host \
+              -v $(pwd):/src:ro \
+              -v /var/tmp:/var/tmp \
+              --tmpfs /var/lib/containers \
+              -v /run/systemd:/run/systemd \
+              localhost/bootc /src/crates/ostree-ext/ci/priv-integration-patched-full-v2.sh \
+            || rc=$?
+          exit "$rc"
+
+      - name: Dump full script log (always, for diagnosis regardless of watchdog exit path)
+        if: always()
+        run: |
+          set -x
+          if [ -f /var/tmp/full-patched-repro-v2.log ]; then
+            cat /var/tmp/full-patched-repro-v2.log
+          else
+            echo "no /var/tmp/full-patched-repro-v2.log found"
+          fi
+
+      - name: Check for the final success line
+        if: always()
+        run: |
+          set -x
+          grep -q '^ok privileged integration$' /var/tmp/full-patched-repro-v2.log && \
+            echo "FOUND: final 'ok privileged integration' success line" || \
+            (echo "MISSING: final success line not found" && exit 1)
+
+      - name: Check the journal message was actually found (not silently skipped)
+        if: always()
+        run: |
+          set -x
+          grep -q 'layers already present: ' /var/tmp/full-patched-repro-v2.log && \
+            echo "FOUND: journal check passed" || \
+            (echo "MISSING: journal check did not find the expected message" && exit 1)
+
+      - name: Grep for any unexpected systemd/dbus-related error strings anywhere in the log
+        if: always()
+        run: |
+          set -x
+          if grep -inE 'systemctl|Failed to connect to bus|finalize-staged|pids.*not (available|delegated)|Operation not permitted' /var/tmp/full-patched-repro-v2.log; then
+            echo "FOUND systemd/dbus/cgroup-related error strings above -- inspect closely, this needs scrutiny"
+          else
+            echo "CONFIRMED: zero systemd/dbus/cgroup-related error strings found anywhere in the log"
+          fi
